@@ -165,7 +165,7 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> {
             const SizedBox(height: 8),
             _card(isDark, () {
               final rows = <({String label, String value})>[
-                (label: 'mDNS name', value: d.mdnsName ?? '—'),
+                (label: 'Name', value: d.mdnsName ?? '—'),
                 if (d.hostname != null && d.hostname != d.mdnsName)
                   (label: 'Hostname (PTR)', value: d.hostname!),
                 if (d.nameSourceText.isNotEmpty)
@@ -183,6 +183,84 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> {
                   ),
               ];
             }()),
+            if (d.upnp != null) ...[
+              const SizedBox(height: 16),
+              _sectionTitle('UPnP / SSDP', isDark),
+              const SizedBox(height: 8),
+              _card(isDark, () {
+                final u = d.upnp!;
+                final rows = <({String label, String value})>[
+                  if (u.friendlyName != null)
+                    (label: 'Friendly name', value: u.friendlyName!),
+                  if (u.manufacturer != null)
+                    (label: 'Manufacturer', value: u.manufacturer!),
+                  if (u.modelName != null)
+                    (
+                      label: 'Model',
+                      value: u.modelNumber != null
+                          ? '${u.modelName} ${u.modelNumber}'
+                          : u.modelName!,
+                    ),
+                  if (u.deviceType != null)
+                    (label: 'Device type', value: u.deviceType!),
+                  if (u.server != null) (label: 'Server', value: u.server!),
+                  if (u.sts.isNotEmpty)
+                    (label: 'Services', value: u.sts.join(', ')),
+                  if (u.location != null)
+                    (label: 'Description', value: u.location!),
+                  if (u.serialNumber != null)
+                    (label: 'Serial', value: u.serialNumber!),
+                ];
+                return [
+                  for (var i = 0; i < rows.length; i++)
+                    _row(
+                      rows[i].label,
+                      rows[i].value,
+                      isDark,
+                      last: i == rows.length - 1,
+                    ),
+                ];
+              }()),
+            ],
+            if (d.netbiosNames.isNotEmpty) ...[
+              const SizedBox(height: 16),
+              _sectionTitle('NetBIOS', isDark),
+              const SizedBox(height: 8),
+              _card(isDark, () {
+                final rows = d.netbiosNames;
+                return [
+                  for (var i = 0; i < rows.length; i++)
+                    _row(
+                      rows[i].unique ? 'Name' : 'Group',
+                      rows[i].label,
+                      isDark,
+                      last: i == rows.length - 1,
+                    ),
+                ];
+              }()),
+            ],
+            if (d.httpServer != null || d.httpTitle != null) ...[
+              const SizedBox(height: 16),
+              _sectionTitle('Web interface', isDark),
+              const SizedBox(height: 8),
+              _card(isDark, () {
+                final rows = <({String label, String value})>[
+                  if (d.httpTitle != null)
+                    (label: 'Title', value: d.httpTitle!),
+                  if (d.httpServer != null)
+                    (label: 'Server', value: d.httpServer!),
+                ];
+                return [
+                  for (var i = 0; i < rows.length; i++)
+                    _row(
+                      rows[i].label,
+                      rows[i].value,
+                      isDark,
+                      last: i == rows.length - 1,
+                    ),
+                ];
+              }()),
+            ],
             const SizedBox(height: 16),
             Row(
               children: [
@@ -219,6 +297,44 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> {
                 _serviceCard(s, isDark, themeColor),
                 const SizedBox(height: 8),
               ],
+            const SizedBox(height: 8),
+            CenteredButton(
+              text: _probing ? 'Querying…' : 'Query via Bonjour (mDNS)',
+              icon: _probing ? null : Icons.wifi_tethering,
+              isPrimary: true,
+              isBlock: true,
+              disabled: _probing,
+              onTap: _probe,
+            ),
+            const SizedBox(height: 8),
+            TDText(
+              'Sends one unicast Bonjour query at this device — catches it '
+              'if it just woke. It cannot wake a sleeping device.',
+              font: TDTheme.of(context).fontBodySmall,
+              textColor: isDark ? Colors.grey.shade500 : Colors.grey.shade500,
+            ),
+            if (_probeAnswered != null) ...[
+              const SizedBox(height: 8),
+              _card(isDark, [
+                Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 4),
+                  child: TDText(
+                    _probeAnswered!
+                        ? 'Answered — identity and services above are '
+                              'fresh from this device.'
+                        : 'No answer — device is still silent. Data shown '
+                              'is from the last live answer'
+                              '${d.lastSeenAt != null ? ' (${_formatTime(d.lastSeenAt!)})' : ''}.',
+                    font: TDTheme.of(context).fontBodySmall,
+                    textColor: _probeAnswered!
+                        ? themeColor
+                        : (isDark
+                              ? Colors.grey.shade400
+                              : Colors.grey.shade600),
+                  ),
+                ),
+              ]),
+            ],
             const SizedBox(height: 16),
             _sectionTitle('Port scan', isDark),
             const SizedBox(height: 8),
@@ -274,46 +390,6 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> {
                       ],
                     ),
                   ),
-              ]),
-            ],
-            const SizedBox(height: 20),
-            _sectionTitle('Bonjour probe', isDark),
-            const SizedBox(height: 8),
-            CenteredButton(
-              text: _probing ? 'Querying…' : 'Query via Bonjour (mDNS)',
-              icon: _probing ? null : Icons.wifi_tethering,
-              isPrimary: true,
-              isBlock: true,
-              disabled: _probing,
-              onTap: _probe,
-            ),
-            const SizedBox(height: 8),
-            TDText(
-              'Sends one unicast Bonjour query at this device — catches it '
-              'if it just woke. It cannot wake a sleeping device.',
-              font: TDTheme.of(context).fontBodySmall,
-              textColor: isDark ? Colors.grey.shade500 : Colors.grey.shade500,
-            ),
-            if (_probeAnswered != null) ...[
-              const SizedBox(height: 8),
-              _card(isDark, [
-                Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 4),
-                  child: TDText(
-                    _probeAnswered!
-                        ? 'Answered — identity and services above are '
-                              'fresh from this device.'
-                        : 'No answer — device is still silent. Data shown '
-                              'is from the last live answer'
-                              '${d.lastSeenAt != null ? ' (${_formatTime(d.lastSeenAt!)})' : ''}.',
-                    font: TDTheme.of(context).fontBodySmall,
-                    textColor: _probeAnswered!
-                        ? themeColor
-                        : (isDark
-                              ? Colors.grey.shade400
-                              : Colors.grey.shade600),
-                  ),
-                ),
               ]),
             ],
           ],

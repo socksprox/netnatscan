@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 
 import '../services/mdns_discovery.dart';
+import '../services/nbns_discovery.dart';
+import '../services/ssdp_discovery.dart';
 
 enum DeviceType {
   thisDevice,
@@ -30,6 +32,9 @@ enum DeviceNameSource {
   vendor,
   gateway,
   tls,
+  ssdp,
+  netbios,
+  http,
 }
 
 class NetworkDevice {
@@ -74,6 +79,19 @@ class NetworkDevice {
   /// derived from it ("Foscam camera").
   String? tlsSubject;
   String? tlsName;
+
+  /// UPnP/SSDP self-description when the device answered M-SEARCH —
+  /// friendlyName, manufacturer, model, device-type URN, server header.
+  SsdpDevice? upnp;
+
+  /// NetBIOS names from a UDP/137 node-status answer — Windows hosts,
+  /// Samba NASes and some printers identify themselves this way.
+  final List<NbnsName> netbiosNames = [];
+
+  /// HTTP Server header and page <title> when a port scan found a web
+  /// admin interface — routers/cameras/NASes self-identify there.
+  String? httpServer;
+  String? httpTitle;
 
   NetworkDevice({
     required this.ip,
@@ -122,6 +140,9 @@ class NetworkDevice {
     DeviceNameSource.vendor => 'OUI guess',
     DeviceNameSource.gateway => 'gateway',
     DeviceNameSource.tls => 'TLS cert',
+    DeviceNameSource.ssdp => 'UPnP name',
+    DeviceNameSource.netbios => 'NetBIOS',
+    DeviceNameSource.http => 'HTTP title',
     DeviceNameSource.none => '',
   };
 
@@ -222,6 +243,49 @@ class NetworkDevice {
       if (rule != null) return rule;
     }
 
+    // UPnP device-type URNs — the device's own self-description, same
+    // tier of evidence as Bonjour service types.
+    final urn = '${upnp?.deviceType ?? ''} ${upnp?.sts.join(' ') ?? ''}'
+        .toLowerCase();
+    if (urn.isNotEmpty) {
+      if (_has(urn, [
+        'internetgatewaydevice',
+        'wandevice',
+        'wanconnectiondevice',
+      ])) {
+        return DeviceType.router;
+      }
+      if (_has(urn, ['dial-multiscreen', 'mediarenderer', 'mediaserver'])) {
+        return DeviceType.tv;
+      }
+      if (_has(urn, ['digitalsecuritycamera', 'networkcamera'])) {
+        return DeviceType.camera;
+      }
+      if (_has(urn, ['printer'])) return DeviceType.printer;
+      if (_has(urn, ['scanner'])) return DeviceType.printer;
+    }
+    // UPnP manufacturer / SERVER header keywords.
+    final upnpText =
+        '${upnp?.manufacturer ?? ''} ${upnp?.modelName ?? ''} '
+                '${upnp?.server ?? ''}'
+            .toLowerCase();
+    if (_has(upnpText, [
+      'foscam',
+      'hikvision',
+      'dahua',
+      'reolink',
+      'amcrest',
+      'axis',
+      'vivotek',
+      'ipcam',
+      'netcam',
+    ])) {
+      return DeviceType.camera;
+    }
+    if (_has(upnpText, ['synology', 'qnap', 'nas', 'diskstation'])) {
+      return DeviceType.computer;
+    }
+
     // TLS cert names are explicit self-identification ("Foscam camera").
     if (tlsName != null) {
       final t = tlsName!.toLowerCase();
@@ -259,6 +323,8 @@ class NetworkDevice {
     if (openPorts.contains(445) || openPorts.contains(548)) {
       return DeviceType.computer; // SMB / AFP
     }
+    // A NetBIOS name table means a Windows/Samba host — computer or NAS.
+    if (netbiosNames.isNotEmpty) return DeviceType.computer;
 
     // Remaining hostname hints.
     if (_has(h, ['homepod', 'echo', 'alexa', 'sonos'])) {

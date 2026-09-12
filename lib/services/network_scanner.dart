@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
@@ -7,7 +8,9 @@ import 'package:flutter/services.dart';
 import '../models/network_device.dart';
 import 'mdns_discovery.dart';
 import 'name_cache.dart';
+import 'nbns_discovery.dart';
 import 'oui_db.dart';
+import 'ssdp_discovery.dart';
 
 /// One local network interface as reported by the macOS side.
 class InterfaceInfo {
@@ -291,12 +294,14 @@ class NetworkScanner extends ChangeNotifier {
           InterfaceInfo._toInt(a.ip).compareTo(InterfaceInfo._toInt(b.ip)),
     );
     devices = found;
+    _nameCandidates.clear();
     debugPrint(
       'netnatscan: ARP scan found ${found.length} devices on ${iface.cidr ?? iface.ip}',
     );
     notifyListeners();
 
-    // --- Phase 3: enrichment (mDNS names + PTR + latency), best-effort. ---
+    // --- Phase 3: enrichment (mDNS + SSDP + PTR + NBNS + latency),
+    // best-effort. ---
     progress = ScanProgress(
       ScanPhase.resolving,
       0,
@@ -305,9 +310,10 @@ class NetworkScanner extends ChangeNotifier {
     );
     notifyListeners();
     final mdnsFuture = _discoverMdns();
+    final ssdpFuture = _discoverSsdp();
     var resolved = 0;
     await _pool(devices, 24, (d) async {
-      await Future.wait([_resolveName(d), _probeLatency(d)]);
+      await Future.wait([_resolveName(d), _probeLatency(d), _queryNbns(d)]);
       resolved++;
       if (resolved % 4 == 0 || resolved == devices.length) {
         progress = ScanProgress(
@@ -319,7 +325,7 @@ class NetworkScanner extends ChangeNotifier {
         notifyListeners();
       }
     });
-    await mdnsFuture;
+    await Future.wait([mdnsFuture, ssdpFuture]);
     await _applyNameCache();
     _startPassiveMdns();
 
@@ -381,61 +387,35 @@ class NetworkScanner extends ChangeNotifier {
     }
   }
 
-  /// Maps a browse result onto the device list: names, service types, and
-  /// the full service records shown in the detail view. Prefer IPs proven
-  /// by SRV→A resolution — devices mirror each other's PTRs, so the packet
-  /// source alone can misattribute services (and names).
-  void _applyMdnsResult(MdnsResult result) {
+  /// Name hints every protocol contributes to, keyed by device IP —
+  /// (name, weight, source, detail). mDNS, SSDP, NBNS and HTTP all feed
+  /// the same pool; `_finalizeNames` picks the best per device, so the
+  /// displayed name is always the strongest evidence available.
+  final _nameCandidates =
+      <String, List<(String, int, DeviceNameSource, String?)>>{};
+
+  void _addNameCandidate(
+    String ip,
+    String? name,
+    int weight,
+    DeviceNameSource src, [
+    String? detail,
+  ]) {
+    if (name == null) return;
+    final n = name.trim();
+    if (n.isEmpty || n == ip) return;
+    final list = _nameCandidates.putIfAbsent(ip, () => []);
+    if (list.any((c) => c.$1 == n && c.$3 == src)) return;
+    list.add((n, weight, src, detail));
+  }
+
+  /// Scores all accumulated candidates and assigns each device its best
+  /// name + provenance. Pure naming — the apply methods own liveness
+  /// (`lastSeenAt`/`isStandby`) so re-running this never fabricates
+  /// freshness.
+  void _finalizeNames() {
     final byIp = {for (final d in devices) d.ip: d};
-
-    // Collect every name hint per device with its provenance, then pick
-    // the best one rather than the first to arrive: a device's own
-    // hostname (reverse-PTR) outweighs service-level names, cryptic
-    // blobs lose to anything readable, and short wins ties — a TV shows
-    // "Vee tv" instead of its googlecast UUID.
-    final candidates =
-        <String, List<(String, int, DeviceNameSource, String?)>>{};
-    void addCandidate(
-      String ip,
-      String? name,
-      int weight,
-      DeviceNameSource src, [
-      String? detail,
-    ]) {
-      if (name == null || name.isEmpty) return;
-      candidates.putIfAbsent(ip, () => []).add((name, weight, src, detail));
-    }
-
-    for (final e in result.ptrNames.entries) {
-      addCandidate(e.key, e.value, 40, DeviceNameSource.mdnsPtr);
-    }
-    for (final svc in result.services) {
-      final type = svc.type
-          .toLowerCase()
-          .replaceAll(RegExp(r'\.$'), '')
-          .replaceAll(RegExp(r'\._(tcp|udp)$'), '');
-      // The SRV host only names the addresses its A/AAAA records prove.
-      if (svc.host != null) {
-        final host = svc.host!.replaceAll(RegExp(r'\.local$'), '');
-        for (final ip in svc.resolvedIps) {
-          addCandidate(ip, host, 30, DeviceNameSource.mdnsHost, type);
-        }
-      }
-      final ips = svc.resolvedIps.isNotEmpty ? svc.resolvedIps : svc.ips;
-      for (final ip in ips) {
-        addCandidate(ip, svc.name, 30, DeviceNameSource.mdnsInstance, type);
-        final d = byIp[ip];
-        if (d == null) continue;
-        if (type.isNotEmpty) d.mdnsTypes.add(type);
-        d.mdnsServices.removeWhere(
-          (s) => s.name == svc.name && s.type == svc.type,
-        );
-        d.mdnsServices.add(svc);
-        d.isStandby = false;
-        d.lastSeenAt = DateTime.now();
-      }
-    }
-    for (final e in candidates.entries) {
+    for (final e in _nameCandidates.entries) {
       final d = byIp[e.key];
       if (d == null) continue;
       e.value.sort(
@@ -450,10 +430,158 @@ class NetworkScanner extends ChangeNotifier {
       d.seenNames.addAll(e.value.map((c) => c.$1));
       d.seenNames.remove(best.$1);
       d.hostname ??= d.mdnsName;
+    }
+    notifyListeners();
+  }
+
+  /// Maps a browse result onto the device list: names, service types, and
+  /// the full service records shown in the detail view. Prefer IPs proven
+  /// by SRV→A resolution — devices mirror each other's PTRs, so the packet
+  /// source alone can misattribute services (and names).
+  void _applyMdnsResult(MdnsResult result) {
+    final byIp = {for (final d in devices) d.ip: d};
+    final answered = <String>{};
+
+    for (final e in result.ptrNames.entries) {
+      _addNameCandidate(e.key, e.value, 40, DeviceNameSource.mdnsPtr);
+      answered.add(e.key);
+    }
+    for (final svc in result.services) {
+      final type = svc.type
+          .toLowerCase()
+          .replaceAll(RegExp(r'\.$'), '')
+          .replaceAll(RegExp(r'\._(tcp|udp)$'), '');
+      // The SRV host only names the addresses its A/AAAA records prove.
+      if (svc.host != null) {
+        final host = svc.host!.replaceAll(RegExp(r'\.local$'), '');
+        for (final ip in svc.resolvedIps) {
+          _addNameCandidate(ip, host, 30, DeviceNameSource.mdnsHost, type);
+          answered.add(ip);
+        }
+      }
+      final ips = svc.resolvedIps.isNotEmpty ? svc.resolvedIps : svc.ips;
+      for (final ip in ips) {
+        _addNameCandidate(
+          ip,
+          svc.name,
+          30,
+          DeviceNameSource.mdnsInstance,
+          type,
+        );
+        answered.add(ip);
+        final d = byIp[ip];
+        if (d == null) continue;
+        if (type.isNotEmpty) d.mdnsTypes.add(type);
+        d.mdnsServices.removeWhere(
+          (s) => s.name == svc.name && s.type == svc.type,
+        );
+        d.mdnsServices.add(svc);
+      }
+    }
+    for (final ip in answered) {
+      final d = byIp[ip];
+      if (d == null) continue;
       d.isStandby = false;
       d.lastSeenAt = DateTime.now();
     }
-    notifyListeners();
+    _finalizeNames();
+  }
+
+  /// SSDP/UPnP: M-SEARCH the LAN, then feed friendlyName/model into the
+  /// name pool and stash the full self-description for the detail view.
+  Future<void> _discoverSsdp() async {
+    try {
+      final found = await SsdpDiscovery.discover(
+        timeout: const Duration(milliseconds: 2500),
+        targets: [for (final d in devices) d.ip],
+      );
+      debugPrint('netnatscan ssdp: ${found.length} devices');
+      final byIp = {for (final d in devices) d.ip: d};
+      for (final e in found.entries) {
+        final d = byIp[e.key];
+        if (d == null) continue;
+        d.upnp = e.value;
+        d.isStandby = false;
+        d.lastSeenAt = DateTime.now();
+        d.vendor ??= e.value.manufacturer;
+        _addNameCandidate(
+          e.key,
+          e.value.friendlyName,
+          35,
+          DeviceNameSource.ssdp,
+          'friendlyName',
+        );
+        _addNameCandidate(
+          e.key,
+          e.value.modelName,
+          22,
+          DeviceNameSource.ssdp,
+          'model',
+        );
+      }
+      _finalizeNames();
+    } catch (e) {
+      debugPrint('netnatscan: SSDP discovery failed: $e');
+    }
+  }
+
+  /// NetBIOS node-status per device — Windows/Samba hosts answer with
+  /// their registered names; the unique <00> name is the machine name.
+  Future<void> _queryNbns(NetworkDevice d) async {
+    try {
+      final names = await NbnsDiscovery.query(d.ip);
+      if (names.isEmpty) return;
+      d.netbiosNames
+        ..clear()
+        ..addAll(names);
+      d.isStandby = false;
+      d.lastSeenAt ??= DateTime.now();
+      for (final n in names) {
+        if (n.suffix == 0x00 && n.unique) {
+          _addNameCandidate(d.ip, n.name, 30, DeviceNameSource.netbios, 'NBNS');
+        }
+      }
+      _finalizeNames();
+    } catch (_) {}
+  }
+
+  /// HTTP identity grab: when a port scan found a web admin port, GET /
+  /// and take the Server header and <title> — routers, cameras and NAS
+  /// boxes announce themselves there.
+  Future<void> _probeHttp(NetworkDevice d) async {
+    for (final port in [80, 8080, 8000, 8888]) {
+      if (!d.openPorts.contains(port)) continue;
+      final client = HttpClient();
+      client.connectionTimeout = const Duration(milliseconds: 1200);
+      try {
+        final req = await client
+            .get(d.ip, port, '/')
+            .timeout(const Duration(milliseconds: 1500));
+        final resp = await req.close().timeout(
+          const Duration(milliseconds: 1500),
+        );
+        d.httpServer = resp.headers.value('server');
+        final body = StringBuffer();
+        await for (final chunk in resp.transform(utf8.decoder)) {
+          body.write(chunk);
+          if (body.length > 16384) break;
+        }
+        final m = RegExp(
+          '<title[^>]*>(.*?)</title>',
+          caseSensitive: false,
+          dotAll: true,
+        ).firstMatch(body.toString());
+        final title = m?.group(1)?.trim();
+        if (title != null && title.isNotEmpty) d.httpTitle = title;
+        d.lastSeenAt ??= DateTime.now();
+        _addNameCandidate(d.ip, d.httpTitle, 22, DeviceNameSource.http);
+        _finalizeNames();
+        return;
+      } catch (_) {
+      } finally {
+        client.close();
+      }
+    }
   }
 
   int _nameScore((String, int, DeviceNameSource, String?) c) =>
@@ -750,6 +878,7 @@ class NetworkScanner extends ChangeNotifier {
       );
     }
     if (d.openPorts.any((p) => p == 443 || p == 8443)) await _probeTls(d);
+    await _probeHttp(d);
     notifyListeners();
   }
 
