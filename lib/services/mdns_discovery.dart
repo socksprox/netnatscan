@@ -8,10 +8,17 @@ import 'dart:typed_data';
 class MdnsResult {
   final List<MdnsService> services;
 
-  /// IPv4 address → advertised hostname (without `.local`).
-  final Map<String, String> deviceNames;
+  /// IPv4 → hostname asserted by the device's own reverse-PTR
+  /// (`187.0.168.192.in-addr.arpa -> name.local`) — the strongest hint,
+  /// this is the device naming itself.
+  final Map<String, String> ptrNames;
 
-  MdnsResult(this.services, this.deviceNames);
+  /// IPv4 → hostname resolved from SRV targets via A records — a service
+  /// detail that usually equals the device hostname but can be generic
+  /// ("Android") or a UUID.
+  final Map<String, String> hostNames;
+
+  MdnsResult(this.services, this.ptrNames, this.hostNames);
 }
 
 /// A discovered Bonjour/mDNS service instance.
@@ -27,6 +34,11 @@ class MdnsService {
   String? host;
   int? port;
   final Set<String> ips = {};
+
+  /// IPs proven by the SRV target's A/AAAA records — the set that actually
+  /// owns this service. `ips` also includes mere PTR senders, which can
+  /// mirror other devices' services.
+  final Set<String> resolvedIps = {};
   final Map<String, String> txt = {};
 
   MdnsService(this.name, this.type);
@@ -88,7 +100,8 @@ class MdnsDiscovery {
 
     final services = <String, MdnsService>{};
     final hostIps = <String, Set<String>>{};
-    final deviceNames = <String, String>{};
+    final ptrNames = <String, String>{};
+    final hostNames = <String, String>{};
     final seenTypes = <String>{};
     final queued = <String>{
       for (final t in types) _fqdn(t),
@@ -110,7 +123,7 @@ class MdnsDiscovery {
             queued.add(typeFqdn);
           }
         },
-        (ip, name) => deviceNames.putIfAbsent(ip, () => name),
+        (ip, name) => ptrNames.putIfAbsent(ip, () => name),
       );
     }
 
@@ -161,11 +174,12 @@ class MdnsDiscovery {
       if (h == null) continue;
       final ips = hostIps[h.toLowerCase()] ?? const <String>{};
       s.ips.addAll(ips);
+      s.resolvedIps.addAll(ips);
       for (final ip in ips) {
-        deviceNames.putIfAbsent(ip, () => _stripLocal(h));
+        hostNames.putIfAbsent(ip, () => _stripLocal(h));
       }
     }
-    return MdnsResult(services.values.toList(), deviceNames);
+    return MdnsResult(services.values.toList(), ptrNames, hostNames);
   }
 
   static String _fqdn(String type) =>

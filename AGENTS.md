@@ -23,6 +23,16 @@ Flutter macOS app: LAN device scanner in the style of iOS "NetAnalyzer".
    with real MACs (definitive for LAN discovery; catches hosts that ignore ICMP).
 4. Enrichment: OUI vendor (`assets/oui.min.json.gz`, from netscli, via
    `OuiDb`), reverse-DNS hostname, TCP-connect RTT (ports 443/80/22).
+5. `DeviceNameCache` (`lib/services/name_cache.dart`): MAC → name/types
+   persisted to `device_names.json`. Devices silent on mDNS get their
+   identity restored and `isStandby = true` (sleeping phones keep their
+   ARP entry via the Wi-Fi chip but stop answering Bonjour — verified:
+   nothing wakes them remotely, not ICMP/TCP/UDP/unicast-mDNS/AWDL).
+6. Passive loop (`_startPassiveMdns`): a continuous 45s `browse` that
+   re-queries silent devices each cycle — catches wake announcements
+   opportunistically and clears the standby flag when a device answers.
+   Attribution uses `resolvedIps` (SRV→A proven) not packet source —
+   iPhones mirror other devices' PTRs.
 
 Native code is required — Dart cannot read the ARP table or netmasks, and
 the sandbox blocks subprocesses (`ping`, `arp`).

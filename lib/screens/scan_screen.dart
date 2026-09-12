@@ -7,6 +7,7 @@ import '../services/network_scanner.dart';
 import '../services/theme_manager.dart' as theme_manager;
 import '../widgets/centered_button.dart';
 import '../widgets/custom_app_bar.dart';
+import 'device_detail_screen.dart';
 
 class ScanScreen extends StatefulWidget {
   const ScanScreen({super.key});
@@ -168,8 +169,11 @@ class _ScanScreenState extends State<ScanScreen> {
     return ListView.separated(
       itemCount: _scanner.devices.length,
       separatorBuilder: (_, _) => const SizedBox(height: 8),
-      itemBuilder: (context, i) =>
-          _DeviceCard(device: _scanner.devices[i], isDark: isDark),
+      itemBuilder: (context, i) => _DeviceCard(
+        device: _scanner.devices[i],
+        isDark: isDark,
+        scanner: _scanner,
+      ),
     );
   }
 
@@ -327,105 +331,146 @@ class _InfoItem extends StatelessWidget {
 class _DeviceCard extends StatelessWidget {
   final NetworkDevice device;
   final bool isDark;
+  final NetworkScanner scanner;
 
-  const _DeviceCard({required this.device, required this.isDark});
+  const _DeviceCard({
+    required this.device,
+    required this.isDark,
+    required this.scanner,
+  });
 
   @override
   Widget build(BuildContext context) {
     final themeColor = theme_manager.ThemeManager().themeColor;
     final isSelf = device.isSelf;
 
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-      decoration: BoxDecoration(
-        color: isDark ? Colors.grey.shade800 : Colors.white,
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(
-          color: isSelf
-              ? themeColor.withValues(alpha: 0.5)
-              : (isDark ? Colors.grey.shade700 : Colors.grey.shade200),
-        ),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withValues(alpha: isDark ? 0.2 : 0.03),
-            offset: const Offset(0, 1),
-            blurRadius: 3,
+    return Material(
+      borderRadius: BorderRadius.circular(10),
+      clipBehavior: Clip.antiAlias,
+      color: Colors.transparent,
+      child: Ink(
+        decoration: BoxDecoration(
+          color: isDark ? Colors.grey.shade800 : Colors.white,
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(
+            color: isSelf
+                ? themeColor.withValues(alpha: 0.5)
+                : (isDark ? Colors.grey.shade700 : Colors.grey.shade200),
           ),
-        ],
-      ),
-      child: Row(
-        children: [
-          Container(
-            padding: const EdgeInsets.all(8),
-            decoration: BoxDecoration(
-              color: isDark
-                  ? Colors.blue.shade900.withValues(alpha: 0.3)
-                  : Colors.blue.shade50,
-              borderRadius: BorderRadius.circular(8),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withValues(alpha: isDark ? 0.2 : 0.03),
+              offset: const Offset(0, 1),
+              blurRadius: 3,
             ),
-            child: Icon(device.icon, size: 20, color: themeColor),
+          ],
+        ),
+        child: InkWell(
+          onTap: () => Navigator.of(context).push(
+            MaterialPageRoute(
+              builder: (_) =>
+                  DeviceDetailScreen(device: device, scanner: scanner),
+            ),
           ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            child: Row(
               children: [
-                Row(
-                  children: [
-                    Flexible(
-                      child: TDText(
-                        device.displayName,
-                        font: TDTheme.of(context).fontBodyMedium,
-                        textColor: isDark ? Colors.white : Colors.black,
-                        fontWeight: FontWeight.w600,
+                Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: isDark
+                        ? Colors.blue.shade900.withValues(alpha: 0.3)
+                        : Colors.blue.shade50,
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Icon(device.icon, size: 20, color: themeColor),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Flexible(
+                            child: TDText(
+                              device.displayName,
+                              font: TDTheme.of(context).fontBodyMedium,
+                              textColor: isDark ? Colors.white : Colors.black,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                          if (isSelf) ...[
+                            const SizedBox(width: 6),
+                            _Tag(text: 'This device', color: themeColor),
+                          ] else if (device.isGateway) ...[
+                            const SizedBox(width: 6),
+                            _Tag(
+                              text: 'Router',
+                              color: isDark
+                                  ? Colors.orange.shade300
+                                  : Colors.orange.shade700,
+                            ),
+                          ],
+                          if (device.isStandby) ...[
+                            const SizedBox(width: 6),
+                            _Tag(
+                              text: 'Standby',
+                              icon: Icons.bedtime,
+                              color: isDark
+                                  ? Colors.grey.shade400
+                                  : Colors.grey.shade600,
+                            ),
+                          ],
+                        ],
                       ),
-                    ),
-                    if (isSelf) ...[
-                      const SizedBox(width: 6),
-                      _Tag(text: 'This device', color: themeColor),
-                    ] else if (device.isGateway) ...[
-                      const SizedBox(width: 6),
-                      _Tag(
-                        text: 'Router',
-                        color: isDark
-                            ? Colors.orange.shade300
-                            : Colors.orange.shade700,
+                      const SizedBox(height: 2),
+                      TDText(
+                        device.ip +
+                            (device.mac != null ? '  ·  ${device.mac}' : ''),
+                        font: TDTheme.of(context).fontBodySmall,
+                        textColor: isDark
+                            ? Colors.grey.shade400
+                            : Colors.grey.shade600,
                       ),
                     ],
-                  ],
+                  ),
                 ),
-                const SizedBox(height: 2),
-                TDText(
-                  device.ip + (device.mac != null ? '  ·  ${device.mac}' : ''),
-                  font: TDTheme.of(context).fontBodySmall,
-                  textColor: isDark
-                      ? Colors.grey.shade400
-                      : Colors.grey.shade600,
+                const SizedBox(width: 12),
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    TDText(
+                      device.vendor ?? device.typeLabel,
+                      font: TDTheme.of(context).fontBodySmall,
+                      textColor: isDark
+                          ? Colors.grey.shade400
+                          : Colors.grey.shade600,
+                      fontWeight: FontWeight.w500,
+                    ),
+                    if (device.nameSourceText.isNotEmpty)
+                      TDText(
+                        device.nameSourceText,
+                        font: TDTheme.of(context).fontBodySmall,
+                        textColor: isDark
+                            ? Colors.grey.shade500
+                            : Colors.grey.shade500,
+                      ),
+                    if (device.rttMs != null)
+                      TDText(
+                        '${device.rttMs} ms',
+                        font: TDTheme.of(context).fontBodySmall,
+                        textColor: isDark
+                            ? Colors.grey.shade500
+                            : Colors.grey.shade500,
+                      ),
+                  ],
                 ),
               ],
             ),
           ),
-          const SizedBox(width: 12),
-          Column(
-            crossAxisAlignment: CrossAxisAlignment.end,
-            children: [
-              TDText(
-                device.vendor ?? device.typeLabel,
-                font: TDTheme.of(context).fontBodySmall,
-                textColor: isDark ? Colors.grey.shade400 : Colors.grey.shade600,
-                fontWeight: FontWeight.w500,
-              ),
-              if (device.rttMs != null)
-                TDText(
-                  '${device.rttMs} ms',
-                  font: TDTheme.of(context).fontBodySmall,
-                  textColor: isDark
-                      ? Colors.grey.shade500
-                      : Colors.grey.shade500,
-                ),
-            ],
-          ),
-        ],
+        ),
       ),
     );
   }
@@ -434,8 +479,9 @@ class _DeviceCard extends StatelessWidget {
 class _Tag extends StatelessWidget {
   final String text;
   final Color color;
+  final IconData? icon;
 
-  const _Tag({required this.text, required this.color});
+  const _Tag({required this.text, required this.color, this.icon});
 
   @override
   Widget build(BuildContext context) {
@@ -445,14 +491,23 @@ class _Tag extends StatelessWidget {
         color: color.withValues(alpha: 0.12),
         borderRadius: BorderRadius.circular(4),
       ),
-      child: Text(
-        text,
-        style: TextStyle(
-          fontSize: 11,
-          fontWeight: FontWeight.w600,
-          color: color,
-          height: 1.2,
-        ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (icon != null) ...[
+            Icon(icon, size: 11, color: color),
+            const SizedBox(width: 3),
+          ],
+          Text(
+            text,
+            style: TextStyle(
+              fontSize: 11,
+              fontWeight: FontWeight.w600,
+              color: color,
+              height: 1.2,
+            ),
+          ),
+        ],
       ),
     );
   }

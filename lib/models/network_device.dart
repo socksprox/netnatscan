@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import '../services/mdns_discovery.dart';
+
 enum DeviceType {
   thisDevice,
   router,
@@ -14,6 +16,20 @@ enum DeviceType {
   unknown,
 }
 
+/// How the displayed name was learned — the user should always be able
+/// to tell a Bonjour-advertised name from a cache restore or an OUI guess.
+enum DeviceNameSource {
+  none,
+  local,
+  dns,
+  mdnsPtr,
+  mdnsHost,
+  mdnsInstance,
+  cache,
+  vendor,
+  gateway,
+}
+
 class NetworkDevice {
   final String ip;
   String? hostname;
@@ -26,6 +42,27 @@ class NetworkDevice {
   bool isSelf;
   bool respondedToProbe;
 
+  /// The device answered no mDNS this scan — its identity was restored
+  /// from the persistent name cache. Typical for phones in standby,
+  /// which keep their ARP entry via the Wi-Fi chip but go silent at L7.
+  bool isStandby;
+
+  /// Bonjour services this device advertised live in the latest scan.
+  final List<MdnsService> mdnsServices = [];
+
+  /// When its identity was last learned live (cache timestamp when
+  /// restored, `now` when answered).
+  DateTime? lastSeenAt;
+
+  /// Provenance of [displayName] — which record produced the winning
+  /// name, plus a detail like the service type it came through.
+  DeviceNameSource nameSource;
+  String? nameSourceDetail;
+
+  /// Every other name this device was seen under (services, hosts,
+  /// PTRs) — shown in the detail view so the chosen name stays auditable.
+  final Set<String> seenNames = {};
+
   NetworkDevice({
     required this.ip,
     this.hostname,
@@ -36,6 +73,8 @@ class NetworkDevice {
     this.isGateway = false,
     this.isSelf = false,
     this.respondedToProbe = false,
+    this.isStandby = false,
+    this.nameSource = DeviceNameSource.none,
   });
 
   DeviceType get type => _classify();
@@ -47,6 +86,37 @@ class NetworkDevice {
     if (isGateway) return 'Router';
     if (vendor != null && vendor!.isNotEmpty) return '$vendor device';
     return 'Unknown device';
+  }
+
+  /// What produced [displayName] — falls back to the implicit sources
+  /// (gateway label, OUI vendor) when no name record set it.
+  DeviceNameSource get effectiveNameSource =>
+      nameSource != DeviceNameSource.none
+      ? nameSource
+      : isGateway
+      ? DeviceNameSource.gateway
+      : (vendor != null && vendor!.isNotEmpty)
+      ? DeviceNameSource.vendor
+      : DeviceNameSource.none;
+
+  String get nameSourceLabel => switch (effectiveNameSource) {
+    DeviceNameSource.mdnsPtr => 'PTR record',
+    DeviceNameSource.mdnsHost => 'mDNS hostname',
+    DeviceNameSource.mdnsInstance => 'service name',
+    DeviceNameSource.dns => 'DNS PTR',
+    DeviceNameSource.cache => 'cached',
+    DeviceNameSource.local => 'local',
+    DeviceNameSource.vendor => 'OUI guess',
+    DeviceNameSource.gateway => 'gateway',
+    DeviceNameSource.none => '',
+  };
+
+  /// `service name · _androidtvremote2`, `cached`, `OUI guess`, …
+  String get nameSourceText {
+    final base = nameSourceLabel;
+    return base.isNotEmpty && nameSourceDetail != null
+        ? '$base · $nameSourceDetail'
+        : base;
   }
 
   IconData get icon => switch (type) {
@@ -90,6 +160,7 @@ class NetworkDevice {
     '_printer': DeviceType.printer,
     '_pdl-datastream': DeviceType.printer,
     '_companion-link': DeviceType.phone,
+    '_apple-mobdev2': DeviceType.phone,
     '_smb': DeviceType.computer,
     '_afpovertcp': DeviceType.computer,
     '_device-info': DeviceType.computer,

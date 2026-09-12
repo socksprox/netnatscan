@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 
 import '../models/network_device.dart';
 import 'mdns_discovery.dart';
+import 'name_cache.dart';
 import 'oui_db.dart';
 
 /// One local network interface as reported by the macOS side.
@@ -171,6 +172,7 @@ class NetworkScanner extends ChangeNotifier {
   Future<void> scan() async {
     if (scanning) return;
     await OuiDb.instance.load();
+    await DeviceNameCache.instance.load();
     if (network == null) await refreshNetworkInfo();
 
     final iface = network?.primary;
@@ -282,6 +284,7 @@ class NetworkScanner extends ChangeNotifier {
       if (d.isSelf && (d.hostname == null || d.hostname!.isEmpty)) {
         d.hostname = Platform.localHostname.replaceAll(RegExp(r'\.local$'), '');
       }
+      if (d.isSelf) d.nameSource = DeviceNameSource.local;
     }
     found.sort(
       (a, b) =>
@@ -317,6 +320,8 @@ class NetworkScanner extends ChangeNotifier {
       }
     });
     await mdnsFuture;
+    await _applyNameCache();
+    _startPassiveMdns();
 
     for (final d in devices) {
       debugPrint(
@@ -334,6 +339,8 @@ class NetworkScanner extends ChangeNotifier {
   /// the only name devices with private MACs (iPhones) actually broadcast.
   static const _mdnsServiceTypes = [
     '_companion-link._tcp',
+    '_remotepairing._tcp',
+    '_apple-mobdev2._tcp',
     '_airplay._tcp',
     '_raop._tcp',
     '_hap._tcp',
@@ -366,36 +373,186 @@ class NetworkScanner extends ChangeNotifier {
       );
       debugPrint(
         'netnatscan mdns: ${result.services.length} services, '
-        '${result.deviceNames.length} hostnames',
+        '${result.ptrNames.length + result.hostNames.length} hostnames',
       );
-      final byIp = {for (final d in devices) d.ip: d};
-      // Reverse-PTR announcements carry the device's own pretty hostname
-      // ("iPhone-16-Pro-Max-von-Tamino") — better than instance names.
-      for (final e in result.deviceNames.entries) {
-        final d = byIp[e.key];
-        if (d == null) continue;
-        d.mdnsName ??= e.value;
-        d.hostname ??= e.value;
-      }
-      for (final svc in result.services) {
-        final type = svc.type
-            .toLowerCase()
-            .replaceAll(RegExp(r'\.$'), '')
-            .replaceAll(RegExp(r'\._(tcp|udp)$'), '');
-        for (final ip in svc.ips) {
-          final d = byIp[ip];
-          if (d == null) continue;
-          if (svc.name.isNotEmpty) {
-            d.mdnsName ??= svc.name;
-            d.hostname ??= svc.name;
-          }
-          if (type.isNotEmpty) d.mdnsTypes.add(type);
-        }
-      }
-      notifyListeners();
+      _applyMdnsResult(result);
     } catch (e) {
       debugPrint('netnatscan: mDNS discovery failed: $e');
     }
+  }
+
+  /// Maps a browse result onto the device list: names, service types, and
+  /// the full service records shown in the detail view. Prefer IPs proven
+  /// by SRV→A resolution — devices mirror each other's PTRs, so the packet
+  /// source alone can misattribute services (and names).
+  void _applyMdnsResult(MdnsResult result) {
+    final byIp = {for (final d in devices) d.ip: d};
+
+    // Collect every name hint per device with its provenance, then pick
+    // the best one rather than the first to arrive: a device's own
+    // hostname (reverse-PTR) outweighs service-level names, cryptic
+    // blobs lose to anything readable, and short wins ties — a TV shows
+    // "Vee tv" instead of its googlecast UUID.
+    final candidates =
+        <String, List<(String, int, DeviceNameSource, String?)>>{};
+    void addCandidate(
+      String ip,
+      String? name,
+      int weight,
+      DeviceNameSource src, [
+      String? detail,
+    ]) {
+      if (name == null || name.isEmpty) return;
+      candidates.putIfAbsent(ip, () => []).add((name, weight, src, detail));
+    }
+
+    for (final e in result.ptrNames.entries) {
+      addCandidate(e.key, e.value, 40, DeviceNameSource.mdnsPtr);
+    }
+    for (final svc in result.services) {
+      final type = svc.type
+          .toLowerCase()
+          .replaceAll(RegExp(r'\.$'), '')
+          .replaceAll(RegExp(r'\._(tcp|udp)$'), '');
+      // The SRV host only names the addresses its A/AAAA records prove.
+      if (svc.host != null) {
+        final host = svc.host!.replaceAll(RegExp(r'\.local$'), '');
+        for (final ip in svc.resolvedIps) {
+          addCandidate(ip, host, 30, DeviceNameSource.mdnsHost, type);
+        }
+      }
+      final ips = svc.resolvedIps.isNotEmpty ? svc.resolvedIps : svc.ips;
+      for (final ip in ips) {
+        addCandidate(ip, svc.name, 30, DeviceNameSource.mdnsInstance, type);
+        final d = byIp[ip];
+        if (d == null) continue;
+        if (type.isNotEmpty) d.mdnsTypes.add(type);
+        d.mdnsServices.removeWhere(
+          (s) => s.name == svc.name && s.type == svc.type,
+        );
+        d.mdnsServices.add(svc);
+        d.isStandby = false;
+        d.lastSeenAt = DateTime.now();
+      }
+    }
+    for (final e in candidates.entries) {
+      final d = byIp[e.key];
+      if (d == null) continue;
+      e.value.sort(
+        (a, b) => _nameScore(b).compareTo(_nameScore(a)) != 0
+            ? _nameScore(b).compareTo(_nameScore(a))
+            : a.$1.length.compareTo(b.$1.length),
+      );
+      final best = e.value.first;
+      d.mdnsName = best.$1;
+      d.nameSource = best.$3;
+      d.nameSourceDetail = best.$4;
+      d.seenNames.addAll(e.value.map((c) => c.$1));
+      d.seenNames.remove(best.$1);
+      d.hostname ??= d.mdnsName;
+      d.isStandby = false;
+      d.lastSeenAt = DateTime.now();
+    }
+    notifyListeners();
+  }
+
+  int _nameScore((String, int, DeviceNameSource, String?) c) =>
+      c.$2 - (_crypticName.hasMatch(c.$1) ? 25 : 0);
+
+  /// Service/host names that are identifiers, not labels: UUIDs, MACs,
+  /// '@'-suffixed ids, and long hex runs ("96005366-8df3-…", "b6:6c:…@",
+  /// "B36ACBEE-…"). Readable names don't match any of these.
+  static final _crypticName = RegExp(
+    r'@'
+    r'|([0-9a-fA-F]{2}[:-]){3,}'
+    r'|[0-9a-fA-F]{16,}'
+    r'|[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}',
+  );
+
+  bool _passiveMdnsRunning = false;
+  bool _disposed = false;
+
+  /// Long-lived background browse: keeps the 5353 socket open and re-asks
+  /// silent devices once per cycle. Nothing can wake a sleeping phone
+  /// remotely — but when it surfaces on its own for maintenance, this
+  /// catches the announcement or answer within a minute and restores its
+  /// live identity instead of the cached standby one.
+  void _startPassiveMdns() {
+    if (_passiveMdnsRunning) return;
+    _passiveMdnsRunning = true;
+    () async {
+      while (!_disposed) {
+        try {
+          final result = await MdnsDiscovery.browse(
+            types: _mdnsServiceTypes,
+            timeout: const Duration(seconds: 45),
+            targets: [
+              for (final d in devices)
+                if (d.mdnsTypes.isEmpty) d.ip,
+            ],
+          );
+          if (_disposed) return;
+          _applyMdnsResult(result);
+          await _applyNameCache();
+        } catch (_) {}
+        if (!_disposed) await Future.delayed(const Duration(seconds: 5));
+      }
+    }();
+  }
+
+  /// One-shot re-probe of a single device from the detail view: unicast
+  /// mDNS straight at it, in case it woke since the last scan.
+  Future<void> probeDevice(NetworkDevice d) async {
+    try {
+      final result = await MdnsDiscovery.browse(
+        types: _mdnsServiceTypes,
+        timeout: const Duration(milliseconds: 2500),
+        targets: [d.ip],
+      );
+      _applyMdnsResult(result);
+      await _applyNameCache();
+    } catch (_) {}
+  }
+
+  @override
+  void dispose() {
+    _disposed = true;
+    super.dispose();
+  }
+
+  /// Phones in standby keep their ARP entry alive via the Wi-Fi chip but
+  /// stop answering Bonjour — they show up silent. When a device gave us
+  /// no live mDNS this scan, restore its identity from the persistent
+  /// MAC-keyed cache and flag it as standby; when it did answer, refresh
+  /// the cache so the next silent scan still knows its name.
+  Future<void> _applyNameCache() async {
+    final cache = DeviceNameCache.instance;
+    for (final d in devices) {
+      final mac = d.mac;
+      if (mac == null) continue;
+      final name = d.mdnsName ?? d.hostname;
+      final live =
+          d.mdnsTypes.isNotEmpty ||
+          (name != null && name.isNotEmpty && name != d.ip);
+      if (live) {
+        d.isStandby = false;
+        d.lastSeenAt ??= DateTime.now();
+        if (name != null && name.isNotEmpty) {
+          cache.update(mac, name, d.mdnsTypes);
+        }
+      } else {
+        final cached = cache.lookup(mac);
+        if (cached != null) {
+          d.mdnsName = cached.name;
+          d.nameSource = DeviceNameSource.cache;
+          d.nameSourceDetail = null;
+          d.mdnsTypes.addAll(cached.mdnsTypes);
+          d.isStandby = true;
+          d.lastSeenAt = cached.lastSeen;
+        }
+      }
+    }
+    await cache.save();
   }
 
   Future<void> _resolveName(NetworkDevice d) async {
@@ -407,6 +564,7 @@ class NetworkScanner extends ChangeNotifier {
       if (host.endsWith('.')) host = host.substring(0, host.length - 1);
       if (host != d.ip && host.isNotEmpty) {
         d.hostname = host.replaceAll(RegExp(r'\.local$'), '');
+        if (d.mdnsName == null) d.nameSource = DeviceNameSource.dns;
       }
     } catch (_) {}
   }
