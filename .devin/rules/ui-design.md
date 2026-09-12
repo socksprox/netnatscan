@@ -9,11 +9,6 @@ This app's UI reuses the component library and design language from
 `/Users/tamino/Code/N3DS/SFYGameTransferrer` (TDesign-styled Flutter).
 **Do not invent new visual patterns** — reuse or extend the shared components.
 
-**Do NOT add the `tdesign_flutter` package.** The slice of its API the
-components need (`TDText`, `TDTheme`, `TDToast`, `TDFont`) is re-implemented
-locally in `lib/widgets/tdesign.dart` — extend that file when a component
-needs another piece of the API.
-
 ## Component library (already in `lib/`)
 
 | Component | File | Use for |
@@ -24,6 +19,7 @@ needs another piece of the API.
 | `TDesignTabSelector` | `lib/widgets/theme_tab_selector.dart` | Segmented pickers (animated sliding indicator in theme color) |
 | `InfoDialog` | `lib/widgets/info_dialog.dart` | Alerts/confirmations (`InfoDialog.show(...)`) |
 | `ThemeManager` | `lib/services/theme_manager.dart` | Singleton: light/dark/system mode + accent color, persisted |
+| `TDText`/`TDTheme`/`TDToast` | `lib/widgets/tdesign.dart` | TDesign-style text/theme/toast, local re-implementation |
 
 ## Design tokens
 
@@ -55,5 +51,5 @@ needs another piece of the API.
 - Keep it simple — this is a clean utility app, not a dashboard. One job per
   screen, generous whitespace, no clutter.
 - New components must follow the tokens above and live in `lib/widgets/`.
-- Do NOT add UI dependencies beyond `tdesign_flutter` + `flutter_colorpicker`
-  without need.
+- Do NOT add UI dependencies — no `tdesign_flutter`; build components
+  yourself in the same style. `flutter_colorpicker` is the only allowed add.
