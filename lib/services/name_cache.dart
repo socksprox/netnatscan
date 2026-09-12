@@ -62,11 +62,19 @@ class DeviceNameCache {
   CachedDevice? lookup(String? mac) =>
       mac == null ? null : _byMac[mac.toLowerCase()];
 
-  void update(String mac, String name, Set<String> mdnsTypes) {
+  /// [seen] is when the device last actually answered — pass the
+  /// device's answer timestamp, not the time we happened to apply it,
+  /// so "last seen" never drifts forward while a device stays silent.
+  void update(
+    String mac,
+    String name,
+    Set<String> mdnsTypes, {
+    DateTime? seen,
+  }) {
     _byMac[mac.toLowerCase()] = CachedDevice(
       name: name,
       mdnsTypes: {...mdnsTypes},
-      lastSeen: DateTime.now(),
+      lastSeen: seen ?? DateTime.now(),
     );
   }
 

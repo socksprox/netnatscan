@@ -6,7 +6,9 @@ import '../services/network_scanner.dart';
 import '../services/theme_manager.dart' as theme_manager;
 import '../widgets/centered_button.dart';
 import '../widgets/custom_app_bar.dart';
+import '../widgets/squircle_input.dart';
 import '../widgets/tdesign.dart';
+import '../widgets/theme_tab_selector.dart';
 
 /// Everything a scan learned about one device: identity, network facts,
 /// and each Bonjour service with its SRV target, port and TXT answers.
@@ -14,10 +16,15 @@ class DeviceDetailScreen extends StatefulWidget {
   final NetworkDevice device;
   final NetworkScanner scanner;
 
+  /// Set from the device list context menu — starts a common port scan
+  /// as soon as the page opens.
+  final bool autoPortScan;
+
   const DeviceDetailScreen({
     super.key,
     required this.device,
     required this.scanner,
+    this.autoPortScan = false,
   });
 
   @override
@@ -26,13 +33,80 @@ class DeviceDetailScreen extends StatefulWidget {
 
 class _DeviceDetailScreenState extends State<DeviceDetailScreen> {
   bool _probing = false;
+  bool? _probeAnswered;
+  bool _scanningPorts = false;
+  bool _portScanDone = false;
+  int _presetIndex = 0;
+  final _customPorts = TextEditingController();
 
   NetworkDevice get d => widget.device;
 
+  @override
+  void initState() {
+    super.initState();
+    if (widget.autoPortScan) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _scanPorts());
+    }
+  }
+
+  @override
+  void dispose() {
+    _customPorts.dispose();
+    super.dispose();
+  }
+
   Future<void> _probe() async {
-    setState(() => _probing = true);
-    await widget.scanner.probeDevice(d);
-    if (mounted) setState(() => _probing = false);
+    setState(() {
+      _probing = true;
+      _probeAnswered = null;
+    });
+    final answered = await widget.scanner.probeDevice(d);
+    if (mounted) {
+      setState(() {
+        _probing = false;
+        _probeAnswered = answered;
+      });
+    }
+  }
+
+  /// Custom spec wins over the preset: `22,80,443` or ranges `8000-8100`.
+  List<int> _selectedPorts() {
+    final spec = _customPorts.text.trim();
+    if (spec.isNotEmpty) {
+      final ports = <int>{};
+      for (final part in spec.split(',')) {
+        final range = part.trim().split('-');
+        final a = int.tryParse(range.first);
+        final b = int.tryParse(range.last);
+        if (a == null || b == null) continue;
+        for (var p = a; p <= b && p <= a + 4096; p++) {
+          ports.add(p);
+        }
+      }
+      return ports.toList();
+    }
+    return _presetIndex == 0
+        ? NetworkScanner.commonScanPorts
+        : NetworkScanner.extendedScanPorts;
+  }
+
+  Future<void> _scanPorts() async {
+    final ports = _selectedPorts();
+    if (ports.isEmpty) {
+      TDToast.showText('No valid ports — try e.g. 22,80,443', context: context);
+      return;
+    }
+    setState(() {
+      _scanningPorts = true;
+      _portScanDone = false;
+    });
+    await widget.scanner.scanPorts(d, ports);
+    if (mounted) {
+      setState(() {
+        _scanningPorts = false;
+        _portScanDone = true;
+      });
+    }
   }
 
   @override
@@ -51,20 +125,41 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> {
             const SizedBox(height: 16),
             _sectionTitle('Device', isDark),
             const SizedBox(height: 8),
-            _card(isDark, [
-              _row('IP address', d.ip, isDark),
-              if (d.mac != null) _row('MAC address', d.mac!, isDark),
-              if (d.vendor != null) _row('Vendor', d.vendor!, isDark),
-              _row('Type', d.typeLabel, isDark),
-              if (d.rttMs != null) _row('Latency', '${d.rttMs} ms', isDark),
-              if (d.lastSeenAt != null)
-                _row(
-                  d.isStandby ? 'Last seen (cached)' : 'Last seen',
-                  _formatTime(d.lastSeenAt!),
-                  isDark,
-                  last: true,
-                ),
-            ]),
+            _card(isDark, () {
+              final rows = <({String label, String value})>[
+                (label: 'IP address', value: d.ip),
+                if (d.mac != null) (label: 'MAC address', value: d.mac!),
+                if (d.vendor != null) (label: 'Vendor', value: d.vendor!),
+                (label: 'Type', value: d.typeLabel),
+                if (d.rttMs != null) (label: 'Latency', value: '${d.rttMs} ms'),
+                if (d.openPorts.isNotEmpty)
+                  (
+                    label: 'Open ports',
+                    value: (d.openPorts.toList()..sort()).join(', '),
+                  ),
+                if (d.tlsSubject != null)
+                  (
+                    label: 'TLS cert',
+                    value: d.tlsSubject!
+                        .replaceAll(RegExp(r'^/'), '')
+                        .replaceAll('/', ' · '),
+                  ),
+                if (d.lastSeenAt != null)
+                  (
+                    label: 'Last live answer',
+                    value: _formatTime(d.lastSeenAt!),
+                  ),
+              ];
+              return [
+                for (var i = 0; i < rows.length; i++)
+                  _row(
+                    rows[i].label,
+                    rows[i].value,
+                    isDark,
+                    last: i == rows.length - 1,
+                  ),
+              ];
+            }()),
             const SizedBox(height: 16),
             _sectionTitle('Names', isDark),
             const SizedBox(height: 8),
@@ -102,15 +197,15 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> {
               ],
             ),
             const SizedBox(height: 8),
-            if (d.mdnsServices.isEmpty)
+            if (d.isStandby || d.mdnsServices.isEmpty)
               _card(isDark, [
                 Padding(
                   padding: const EdgeInsets.symmetric(vertical: 4),
                   child: TDText(
                     d.isStandby
-                        ? 'Sleeping — identity restored from cache. '
-                              'Types seen earlier: '
-                              '${d.mdnsTypes.isEmpty ? '—' : d.mdnsTypes.join(', ')}'
+                        ? 'Device is silent — data below is the last live '
+                              'answer${d.lastSeenAt != null ? ' (${_formatTime(d.lastSeenAt!)})' : ''}.'
+                              '${d.mdnsServices.isEmpty ? ' Types seen earlier: ${d.mdnsTypes.isEmpty ? '—' : d.mdnsTypes.join(', ')}' : ''}'
                         : 'No services answered.',
                     font: TDTheme.of(context).fontBodySmall,
                     textColor: isDark
@@ -118,26 +213,109 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> {
                         : Colors.grey.shade600,
                   ),
                 ),
-              ])
-            else
+              ]),
+            if (d.mdnsServices.isNotEmpty)
               for (final s in d.mdnsServices) ...[
                 _serviceCard(s, isDark, themeColor),
                 const SizedBox(height: 8),
               ],
-            const SizedBox(height: 20),
+            const SizedBox(height: 16),
+            _sectionTitle('Port scan', isDark),
+            const SizedBox(height: 8),
+            TDesignTabSelector(
+              height: 36,
+              tabs: const [
+                TDesignTabItem(text: 'Common'),
+                TDesignTabItem(text: 'Extended'),
+              ],
+              initialIndex: _presetIndex,
+              onTabChanged: (i) => setState(() => _presetIndex = i),
+            ),
+            const SizedBox(height: 8),
+            SquircleInput(
+              controller: _customPorts,
+              hintText: 'Custom ports, e.g. 22,80,443,8000-8100',
+              enabled: !_scanningPorts,
+              onSubmitted: (_) => _scanPorts(),
+            ),
+            const SizedBox(height: 8),
             CenteredButton(
-              text: _probing ? 'Probing…' : 'Probe again',
-              icon: _probing ? null : Icons.refresh,
+              text: _scanningPorts
+                  ? 'Scanning…'
+                  : 'Scan ${_customPorts.text.trim().isNotEmpty ? _selectedPorts().length : (_presetIndex == 0 ? NetworkScanner.commonScanPorts.length : NetworkScanner.extendedScanPorts.length)} ports',
+              icon: _scanningPorts ? null : Icons.lan_outlined,
+              isBlock: true,
+              disabled: _scanningPorts,
+              onTap: _scanPorts,
+            ),
+            if (_portScanDone || d.openPorts.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              _card(isDark, [
+                if (d.openPorts.isEmpty)
+                  Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 4),
+                    child: TDText(
+                      'No open ports found',
+                      font: TDTheme.of(context).fontBodySmall,
+                      textColor: isDark
+                          ? Colors.grey.shade400
+                          : Colors.grey.shade600,
+                    ),
+                  )
+                else
+                  Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 4),
+                    child: Wrap(
+                      spacing: 6,
+                      runSpacing: 6,
+                      children: [
+                        for (final p in d.openPorts.toList()..sort())
+                          _portChip(p, isDark, themeColor),
+                      ],
+                    ),
+                  ),
+              ]),
+            ],
+            const SizedBox(height: 20),
+            _sectionTitle('Bonjour probe', isDark),
+            const SizedBox(height: 8),
+            CenteredButton(
+              text: _probing ? 'Querying…' : 'Query via Bonjour (mDNS)',
+              icon: _probing ? null : Icons.wifi_tethering,
               isPrimary: true,
+              isBlock: true,
               disabled: _probing,
               onTap: _probe,
             ),
             const SizedBox(height: 8),
             TDText(
-              'Sends a unicast mDNS query straight at this device.',
+              'Sends one unicast Bonjour query at this device — catches it '
+              'if it just woke. It cannot wake a sleeping device.',
               font: TDTheme.of(context).fontBodySmall,
               textColor: isDark ? Colors.grey.shade500 : Colors.grey.shade500,
             ),
+            if (_probeAnswered != null) ...[
+              const SizedBox(height: 8),
+              _card(isDark, [
+                Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 4),
+                  child: TDText(
+                    _probeAnswered!
+                        ? 'Answered — identity and services above are '
+                              'fresh from this device.'
+                        : 'No answer — device is still silent. Data shown '
+                              'is from the last live answer'
+                              '${d.lastSeenAt != null ? ' (${_formatTime(d.lastSeenAt!)})' : ''}.',
+                    font: TDTheme.of(context).fontBodySmall,
+                    textColor: _probeAnswered!
+                        ? themeColor
+                        : (isDark
+                              ? Colors.grey.shade400
+                              : Colors.grey.shade600),
+                  ),
+                ),
+              ]),
+            ],
           ],
         ),
       ),
@@ -232,6 +410,24 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> {
           if (s.ips.isNotEmpty) _kv('Addresses', s.ips.join(', '), isDark),
           for (final e in s.txt.entries) _kv(e.key, e.value, isDark),
         ],
+      ),
+    );
+  }
+
+  Widget _portChip(int port, bool isDark, Color themeColor) {
+    final service = NetworkScanner.portServices[port];
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: themeColor.withValues(alpha: 0.1),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: themeColor.withValues(alpha: 0.3)),
+      ),
+      child: TDText(
+        service != null ? '$port · $service' : '$port',
+        font: TDTheme.of(context).fontBodySmall,
+        textColor: isDark ? Colors.white : Colors.black87,
+        fontWeight: FontWeight.w600,
       ),
     );
   }

@@ -22,7 +22,9 @@ Flutter macOS app: LAN device scanner in the style of iOS "NetAnalyzer".
 3. `getArpTable` → sysctl `NET_RT_FLAGS`/`RTF_LLINFO` dump → live devices
    with real MACs (definitive for LAN discovery; catches hosts that ignore ICMP).
 4. Enrichment: OUI vendor (`assets/oui.min.json.gz`, from netscli, via
-   `OuiDb`), reverse-DNS hostname, TCP-connect RTT (ports 443/80/22).
+   `OuiDb`), reverse-DNS hostname, light TCP RTT probe (443/80/22), and
+   TLS cert subject when 443 answers (cameras/NAS/routers self-identify
+   via cert O field — `*.myfoscam.org` → "Foscam camera").
 5. `DeviceNameCache` (`lib/services/name_cache.dart`): MAC → name/types
    persisted to `device_names.json`. Devices silent on mDNS get their
    identity restored and `isStandby = true` (sleeping phones keep their
@@ -33,6 +35,12 @@ Flutter macOS app: LAN device scanner in the style of iOS "NetAnalyzer".
    opportunistically and clears the standby flag when a device answers.
    Attribution uses `resolvedIps` (SRV→A proven) not packet source —
    iPhones mirror other devices' PTRs.
+7. Explicit port scan: `scanPorts` runs on demand per device — device
+   card context menu (right-click / long-press) → "Port scan", or the
+   Port scan section in the detail view. `commonScanPorts` (20 ports,
+   ~1s) and `extendedScanPorts` (49 ports) are curated by service; open
+   ports feed classification (62078→iPhone, 554→camera, 9100/631→
+   printer, 8008/9→Chromecast, 445/548→computer, 8291→MikroTik).
 
 Native code is required — Dart cannot read the ARP table or netmasks, and
 the sandbox blocks subprocesses (`ping`, `arp`).

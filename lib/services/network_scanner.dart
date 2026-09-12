@@ -501,8 +501,11 @@ class NetworkScanner extends ChangeNotifier {
   }
 
   /// One-shot re-probe of a single device from the detail view: unicast
-  /// mDNS straight at it, in case it woke since the last scan.
-  Future<void> probeDevice(NetworkDevice d) async {
+  /// mDNS straight at it, in case it woke since the last scan. Returns
+  /// true only if this device answered the query just now — a stale
+  /// `lastSeenAt` doesn't count.
+  Future<bool> probeDevice(NetworkDevice d) async {
+    final start = DateTime.now();
     try {
       final result = await MdnsDiscovery.browse(
         types: _mdnsServiceTypes,
@@ -512,6 +515,8 @@ class NetworkScanner extends ChangeNotifier {
       _applyMdnsResult(result);
       await _applyNameCache();
     } catch (_) {}
+    final seen = d.lastSeenAt;
+    return seen != null && seen.isAfter(start);
   }
 
   @override
@@ -522,23 +527,28 @@ class NetworkScanner extends ChangeNotifier {
 
   /// Phones in standby keep their ARP entry alive via the Wi-Fi chip but
   /// stop answering Bonjour — they show up silent. When a device gave us
-  /// no live mDNS this scan, restore its identity from the persistent
+  /// no fresh identity evidence, restore its identity from the persistent
   /// MAC-keyed cache and flag it as standby; when it did answer, refresh
   /// the cache so the next silent scan still knows its name.
+  ///
+  /// "Live" = `lastSeenAt` is recent — set only by real answers (mDNS,
+  /// PTR, TLS). Deriving it from retained fields like `mdnsTypes` would
+  /// keep a once-answered device "live" forever across passive cycles.
   Future<void> _applyNameCache() async {
     final cache = DeviceNameCache.instance;
+    final now = DateTime.now();
     for (final d in devices) {
       final mac = d.mac;
       if (mac == null) continue;
-      final name = d.mdnsName ?? d.hostname;
       final live =
-          d.mdnsTypes.isNotEmpty ||
-          (name != null && name.isNotEmpty && name != d.ip);
+          d.isSelf ||
+          (d.lastSeenAt != null &&
+              now.difference(d.lastSeenAt!) < const Duration(minutes: 1));
       if (live) {
         d.isStandby = false;
-        d.lastSeenAt ??= DateTime.now();
+        final name = d.mdnsName ?? d.hostname;
         if (name != null && name.isNotEmpty) {
-          cache.update(mac, name, d.mdnsTypes);
+          cache.update(mac, name, d.mdnsTypes, seen: d.lastSeenAt);
         }
       } else {
         final cached = cache.lookup(mac);
@@ -565,12 +575,15 @@ class NetworkScanner extends ChangeNotifier {
       if (host != d.ip && host.isNotEmpty) {
         d.hostname = host.replaceAll(RegExp(r'\.local$'), '');
         if (d.mdnsName == null) d.nameSource = DeviceNameSource.dns;
+        d.lastSeenAt = DateTime.now(); // fresh PTR identity evidence
       }
     } catch (_) {}
   }
 
   /// TCP connect gives us an RTT without raw sockets: both a completed
-  /// handshake and a refused connection prove the host is alive and time it.
+  /// handshake and a refused connection prove the host is alive and time
+  /// it. When 443 answers we take the free TLS cert too — one handshake
+  /// on an already-open port, not a scan.
   Future<void> _probeLatency(NetworkDevice d) async {
     const ports = [443, 80, 22];
     for (final port in ports) {
@@ -582,7 +595,9 @@ class NetworkScanner extends ChangeNotifier {
           timeout: const Duration(milliseconds: 400),
         );
         s.destroy();
+        d.openPorts.add(port);
         d.rttMs = sw.elapsedMilliseconds;
+        if (port == 443) await _probeTls(d);
         return;
       } on SocketException catch (e) {
         sw.stop();
@@ -594,6 +609,213 @@ class NetworkScanner extends ChangeNotifier {
         }
       } catch (_) {}
     }
+  }
+
+  /// TCP ports worth checking on an explicit per-device scan, grouped by
+  /// what they reveal — remote access, file sharing, printers, cameras,
+  /// media, IoT, admin panels. `commonScanPorts` probes in ~1s;
+  /// `extendedScanPorts` adds the rarer-but-diagnostic services.
+  static const commonScanPorts = [
+    22,
+    23,
+    53,
+    80,
+    443,
+    445,
+    548,
+    554,
+    631,
+    1883,
+    5000,
+    5060,
+    7000,
+    8008,
+    8009,
+    8080,
+    8443,
+    9100,
+    32400,
+    62078,
+  ];
+  static const extendedScanPorts = [
+    ...commonScanPorts,
+    21,
+    25,
+    110,
+    139,
+    143,
+    515,
+    873,
+    993,
+    995,
+    1723,
+    2049,
+    3000,
+    3128,
+    3306,
+    3389,
+    3689,
+    5357,
+    5432,
+    5900,
+    5985,
+    6379,
+    7547,
+    8000,
+    8291,
+    8883,
+    8888,
+    27017,
+  ];
+
+  /// Well-known service labels for the ports above.
+  static const portServices = {
+    21: 'FTP',
+    22: 'SSH',
+    23: 'Telnet',
+    25: 'SMTP',
+    53: 'DNS',
+    80: 'HTTP',
+    110: 'POP3',
+    139: 'NetBIOS',
+    143: 'IMAP',
+    443: 'HTTPS',
+    445: 'SMB',
+    515: 'LPD',
+    548: 'AFP',
+    554: 'RTSP',
+    631: 'IPP',
+    873: 'rsync',
+    993: 'IMAPS',
+    995: 'POP3S',
+    1723: 'PPTP',
+    1883: 'MQTT',
+    2049: 'NFS',
+    3000: 'dev HTTP',
+    3128: 'proxy',
+    3306: 'MySQL',
+    3389: 'RDP',
+    3689: 'DAAP',
+    5000: 'UPnP',
+    5060: 'SIP',
+    5357: 'WSD',
+    5432: 'PostgreSQL',
+    5900: 'VNC',
+    5985: 'WinRM',
+    6379: 'Redis',
+    7000: 'AirPlay',
+    7547: 'TR-069',
+    8000: 'HTTP alt',
+    8008: 'Chromecast',
+    8009: 'Chromecast TLS',
+    8080: 'HTTP alt',
+    8443: 'HTTPS alt',
+    8883: 'MQTTS',
+    8888: 'HTTP alt',
+    9100: 'JetDirect',
+    27017: 'MongoDB',
+    32400: 'Plex',
+    62078: 'iOS sync',
+    8291: 'Winbox',
+  };
+
+  /// Explicit per-device port scan (from the device menu / detail view) —
+  /// probes [ports] in 8-wide parallel chunks, re-verifies every port in
+  /// the set, and grabs the TLS cert if an HTTPS port answers.
+  Future<void> scanPorts(NetworkDevice d, List<int> ports) async {
+    final list =
+        (ports.toSet()..removeWhere((p) => p <= 0 || p > 65535)).toList()
+          ..sort();
+    d.openPorts.removeAll(list.toSet());
+    for (var i = 0; i < list.length; i += 8) {
+      await Future.wait(
+        list.skip(i).take(8).map((port) async {
+          final sw = Stopwatch()..start();
+          try {
+            final s = await Socket.connect(
+              d.ip,
+              port,
+              timeout: const Duration(milliseconds: 500),
+            );
+            s.destroy();
+            d.openPorts.add(port);
+            d.rttMs ??= sw.elapsedMilliseconds;
+          } on SocketException catch (e) {
+            sw.stop();
+            if (e.osError?.errorCode == 61 || e.osError?.errorCode == 54) {
+              d.rttMs ??= sw.elapsedMilliseconds;
+            }
+          } catch (_) {}
+        }),
+      );
+    }
+    if (d.openPorts.any((p) => p == 443 || p == 8443)) await _probeTls(d);
+    notifyListeners();
+  }
+
+  /// A device answering TLS identifies itself in the certificate subject —
+  /// IP cameras, printers, NAS and routers all ship vendor certs. Grab the
+  /// DN and derive a friendly name + vendor hint from O/CN.
+  Future<void> _probeTls(NetworkDevice d) async {
+    for (final port in [443, 8443]) {
+      if (!d.openPorts.contains(port)) continue;
+      try {
+        final s = await SecureSocket.connect(
+          d.ip,
+          port,
+          timeout: const Duration(milliseconds: 1500),
+          onBadCertificate: (_) => true,
+        );
+        final cert = s.peerCertificate;
+        s.destroy();
+        if (cert == null) continue;
+        d.tlsSubject = cert.subject;
+        d.lastSeenAt = DateTime.now(); // fresh TLS identity evidence
+        _applyTlsIdentity(d, cert.subject);
+        return;
+      } catch (_) {}
+    }
+  }
+
+  void _applyTlsIdentity(NetworkDevice d, String subject) {
+    final org = _dnField(subject, 'O') ?? _dnField(subject, 'CN');
+    if (org == null) return;
+    final o = org.toLowerCase();
+    const names = {
+      'foscam': 'Foscam camera',
+      'hikvision': 'Hikvision camera',
+      'dahua': 'Dahua camera',
+      'reolink': 'Reolink camera',
+      'amcrest': 'Amcrest camera',
+      'axis': 'Axis camera',
+      'vivotek': 'Vivotek camera',
+      'synology': 'Synology NAS',
+      'qnap': 'QNAP NAS',
+      'mikrotik': 'MikroTik router',
+      'ubiquiti': 'Ubiquiti device',
+      'tp-link': 'TP-Link device',
+      'tplink': 'TP-Link device',
+      'netgear': 'Netgear device',
+      'avm': 'FRITZ!Box',
+    };
+    for (final e in names.entries) {
+      if (o.contains(e.key)) {
+        d.tlsName = e.value;
+        d.vendor ??= e.value.replaceAll(
+          RegExp(r' (camera|NAS|router|device)$'),
+          '',
+        );
+        if (d.mdnsName == null) d.nameSource = DeviceNameSource.tls;
+        return;
+      }
+    }
+    d.vendor ??= org;
+  }
+
+  /// Pulls `O=`/`CN=` out of a `/C=CN/ST=…/O=…/CN=…` DN string.
+  static String? _dnField(String subject, String field) {
+    final m = RegExp('(?:^|/)\\s*$field=([^/]+)').firstMatch(subject);
+    return m?.group(1)?.trim();
   }
 
   int _hostCount(InterfaceInfo iface) {

@@ -11,6 +11,7 @@ enum DeviceType {
   tv,
   printer,
   speaker,
+  camera,
   iot,
   vm,
   unknown,
@@ -28,6 +29,7 @@ enum DeviceNameSource {
   cache,
   vendor,
   gateway,
+  tls,
 }
 
 class NetworkDevice {
@@ -36,7 +38,7 @@ class NetworkDevice {
   String? mdnsName;
   final Set<String> mdnsTypes = {};
   final String? mac;
-  final String? vendor;
+  String? vendor;
   int? rttMs;
   bool isGateway;
   bool isSelf;
@@ -63,6 +65,16 @@ class NetworkDevice {
   /// PTRs) — shown in the detail view so the chosen name stays auditable.
   final Set<String> seenNames = {};
 
+  /// TCP ports that accepted a connection — a fingerprint for devices
+  /// that never speak mDNS (cameras, printers, IoT hubs).
+  final Set<int> openPorts = {};
+
+  /// The peer's TLS certificate subject when a TLS port answered
+  /// (`/O=Shenzhen Foscam…/CN=*.myfoscam.org`) and a friendly name
+  /// derived from it ("Foscam camera").
+  String? tlsSubject;
+  String? tlsName;
+
   NetworkDevice({
     required this.ip,
     this.hostname,
@@ -84,6 +96,7 @@ class NetworkDevice {
     if (mdnsName != null && mdnsName!.isNotEmpty) return mdnsName!;
     if (hostname != null && hostname!.isNotEmpty) return hostname!;
     if (isGateway) return 'Router';
+    if (tlsName != null && tlsName!.isNotEmpty) return tlsName!;
     if (vendor != null && vendor!.isNotEmpty) return '$vendor device';
     return 'Unknown device';
   }
@@ -108,6 +121,7 @@ class NetworkDevice {
     DeviceNameSource.local => 'local',
     DeviceNameSource.vendor => 'OUI guess',
     DeviceNameSource.gateway => 'gateway',
+    DeviceNameSource.tls => 'TLS cert',
     DeviceNameSource.none => '',
   };
 
@@ -128,6 +142,7 @@ class NetworkDevice {
     DeviceType.tv => Icons.tv,
     DeviceType.printer => Icons.print,
     DeviceType.speaker => Icons.speaker,
+    DeviceType.camera => Icons.videocam_outlined,
     DeviceType.iot => Icons.memory,
     DeviceType.vm => Icons.cloud_queue,
     DeviceType.unknown => Icons.device_unknown,
@@ -142,6 +157,7 @@ class NetworkDevice {
     DeviceType.tv => 'TV',
     DeviceType.printer => 'Printer',
     DeviceType.speaker => 'Speaker',
+    DeviceType.camera => 'Camera',
     DeviceType.iot => 'Smart device',
     DeviceType.vm => 'Virtual machine',
     DeviceType.unknown => 'Device',
@@ -180,13 +196,8 @@ class NetworkDevice {
     final h = (mdnsName ?? hostname ?? '').toLowerCase();
     final v = vendor?.toLowerCase() ?? '';
 
-    // Advertised Bonjour services are strong evidence of what a device is.
-    for (final t in mdnsTypes) {
-      final rule = _mdnsTypeRules[t];
-      if (rule != null) return rule;
-    }
-
-    // Hostname hints are the strongest signal.
+    // Explicit product names beat service hints — a MacBook Air that
+    // advertises AirPlay is still a computer, not a TV.
     if (_has(h, ['iphone'])) return DeviceType.phone;
     if (_has(h, ['ipad'])) return DeviceType.tablet;
     if (_has(h, [
@@ -203,6 +214,53 @@ class NetworkDevice {
       return DeviceType.computer;
     }
     if (_has(h, ['watch'])) return DeviceType.iot;
+    if (_has(h, ['appletv', 'apple-tv'])) return DeviceType.tv;
+
+    // Advertised Bonjour services are strong evidence of what a device is.
+    for (final t in mdnsTypes) {
+      final rule = _mdnsTypeRules[t];
+      if (rule != null) return rule;
+    }
+
+    // TLS cert names are explicit self-identification ("Foscam camera").
+    if (tlsName != null) {
+      final t = tlsName!.toLowerCase();
+      if (_has(t, [
+        'foscam',
+        'hikvision',
+        'dahua',
+        'reolink',
+        'amcrest',
+        'axis',
+        'vivotek',
+        'unifi protect',
+        'camera',
+      ])) {
+        return DeviceType.camera;
+      }
+      if (_has(t, ['synology', 'qnap', 'nas'])) return DeviceType.computer;
+      if (_has(t, ['mikrotik', 'ubiquiti', 'router'])) {
+        return DeviceType.router;
+      }
+    }
+
+    // Open-port fingerprints for devices that never speak mDNS.
+    // 62078 is Apple's lockdownd pairing — iOS-only, Macs never listen.
+    if (openPorts.contains(62078)) return DeviceType.phone;
+    if (openPorts.contains(554)) return DeviceType.camera; // RTSP
+    if (openPorts.contains(8008) || openPorts.contains(8009)) {
+      return DeviceType.tv; // Chromecast
+    }
+    if (openPorts.contains(9100) || openPorts.contains(631)) {
+      return DeviceType.printer;
+    }
+    if (openPorts.contains(7000)) return DeviceType.tv; // AirPlay
+    if (openPorts.contains(8291)) return DeviceType.router; // Winbox
+    if (openPorts.contains(445) || openPorts.contains(548)) {
+      return DeviceType.computer; // SMB / AFP
+    }
+
+    // Remaining hostname hints.
     if (_has(h, ['homepod', 'echo', 'alexa', 'sonos'])) {
       return DeviceType.speaker;
     }
