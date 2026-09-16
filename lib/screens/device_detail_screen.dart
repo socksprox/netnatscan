@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../models/network_device.dart';
 import '../services/mdns_discovery.dart';
@@ -128,6 +129,8 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> {
             _card(isDark, () {
               final rows = <({String label, String value})>[
                 (label: 'IP address', value: d.ip),
+                if (d.sortedIpv6.isNotEmpty)
+                  (label: 'IPv6', value: d.sortedIpv6.join('\n')),
                 if (d.mac != null) (label: 'MAC address', value: d.mac!),
                 if (d.vendor != null) (label: 'Vendor', value: d.vendor!),
                 (label: 'Type', value: d.typeLabel),
@@ -462,19 +465,23 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
-            children: [
-              Icon(Icons.wifi_tethering, size: 16, color: themeColor),
-              const SizedBox(width: 8),
-              Expanded(
-                child: TDText(
-                  s.name,
-                  font: TDTheme.of(context).fontBodyMedium,
-                  textColor: isDark ? Colors.white : Colors.black,
-                  fontWeight: FontWeight.w600,
+          _copyable(
+            'Name',
+            s.name,
+            Row(
+              children: [
+                Icon(Icons.wifi_tethering, size: 16, color: themeColor),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: TDText(
+                    s.name,
+                    font: TDTheme.of(context).fontBodyMedium,
+                    textColor: isDark ? Colors.white : Colors.black,
+                    fontWeight: FontWeight.w600,
+                  ),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
           const SizedBox(height: 8),
           _kv(
@@ -492,43 +499,64 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> {
 
   Widget _portChip(int port, bool isDark, Color themeColor) {
     final service = NetworkScanner.portServices[port];
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-      decoration: BoxDecoration(
-        color: themeColor.withValues(alpha: 0.1),
-        borderRadius: BorderRadius.circular(6),
-        border: Border.all(color: themeColor.withValues(alpha: 0.3)),
-      ),
-      child: TDText(
-        service != null ? '$port · $service' : '$port',
-        font: TDTheme.of(context).fontBodySmall,
-        textColor: isDark ? Colors.white : Colors.black87,
-        fontWeight: FontWeight.w600,
+    return GestureDetector(
+      onLongPress: () => _copyField('Port', '$port'),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+        decoration: BoxDecoration(
+          color: themeColor.withValues(alpha: 0.1),
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(color: themeColor.withValues(alpha: 0.3)),
+        ),
+        child: TDText(
+          service != null ? '$port · $service' : '$port',
+          font: TDTheme.of(context).fontBodySmall,
+          textColor: isDark ? Colors.white : Colors.black87,
+          fontWeight: FontWeight.w600,
+        ),
       ),
     );
   }
 
-  Widget _kv(String k, String v, bool isDark) => Padding(
-    padding: const EdgeInsets.only(top: 4),
-    child: Row(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        SizedBox(
-          width: 90,
-          child: TDText(
-            k,
-            font: TDTheme.of(context).fontBodySmall,
-            textColor: isDark ? Colors.grey.shade500 : Colors.grey.shade500,
+  /// Informational fields copy their value on long-press (or a
+  /// right-click on desktop).
+  void _copyField(String label, String value) {
+    Clipboard.setData(ClipboardData(text: value));
+    TDToast.showText('$label copied', context: context);
+  }
+
+  Widget _copyable(String label, String value, Widget child) => GestureDetector(
+    behavior: HitTestBehavior.opaque,
+    onLongPress: () => _copyField(label, value),
+    onSecondaryTapUp: (_) => _copyField(label, value),
+    child: child,
+  );
+
+  Widget _kv(String k, String v, bool isDark) => _copyable(
+    k,
+    v,
+    Padding(
+      padding: const EdgeInsets.only(top: 4),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 90,
+            child: TDText(
+              k,
+              font: TDTheme.of(context).fontBodySmall,
+              textColor: isDark ? Colors.grey.shade500 : Colors.grey.shade500,
+            ),
           ),
-        ),
-        Expanded(
-          child: TDText(
-            v,
-            font: TDTheme.of(context).fontBodySmall,
-            textColor: isDark ? Colors.grey.shade300 : Colors.grey.shade700,
+          Expanded(
+            child: TDText(
+              v,
+              font: TDTheme.of(context).fontBodySmall,
+              textColor: isDark ? Colors.grey.shade300 : Colors.grey.shade700,
+            ),
           ),
-        ),
-      ],
+        ],
+      ),
     ),
   );
 
@@ -546,38 +574,44 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> {
   );
 
   Widget _row(String label, String value, bool isDark, {bool last = false}) =>
-      Padding(
-        padding: const EdgeInsets.symmetric(vertical: 6),
-        child: Column(
-          children: [
-            Row(
-              children: [
-                TDText(
-                  label,
-                  font: TDTheme.of(context).fontBodySmall,
-                  textColor: isDark
-                      ? Colors.grey.shade400
-                      : Colors.grey.shade600,
-                ),
-                const Spacer(),
-                Flexible(
-                  child: TDText(
-                    value,
-                    font: TDTheme.of(context).fontBodyMedium,
-                    textColor: isDark ? Colors.white : Colors.black87,
-                    fontWeight: FontWeight.w600,
+      _copyable(
+        label,
+        value,
+        Padding(
+          padding: const EdgeInsets.symmetric(vertical: 6),
+          child: Column(
+            children: [
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  TDText(
+                    label,
+                    font: TDTheme.of(context).fontBodySmall,
+                    textColor: isDark
+                        ? Colors.grey.shade400
+                        : Colors.grey.shade600,
                   ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: TDText(
+                      value,
+                      font: TDTheme.of(context).fontBodyMedium,
+                      textColor: isDark ? Colors.white : Colors.black87,
+                      fontWeight: FontWeight.w600,
+                      textAlign: TextAlign.right,
+                    ),
+                  ),
+                ],
+              ),
+              if (!last) ...[
+                const SizedBox(height: 6),
+                Divider(
+                  height: 1,
+                  color: isDark ? Colors.grey.shade700 : Colors.grey.shade200,
                 ),
               ],
-            ),
-            if (!last) ...[
-              const SizedBox(height: 6),
-              Divider(
-                height: 1,
-                color: isDark ? Colors.grey.shade700 : Colors.grey.shade200,
-              ),
             ],
-          ],
+          ),
         ),
       );
 

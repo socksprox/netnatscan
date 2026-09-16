@@ -18,6 +18,10 @@ class InterfaceInfo {
   final String ip;
   final String? netmask;
   final String? mac;
+
+  /// IPv6 addresses bound to this interface (link-local `%`-scoped,
+  /// ULA, global) — link-local first since it is always present.
+  final List<String> ipv6;
   final bool isUp;
   final bool isLoopback;
 
@@ -26,6 +30,7 @@ class InterfaceInfo {
     required this.ip,
     this.netmask,
     this.mac,
+    this.ipv6 = const [],
     this.isUp = false,
     this.isLoopback = false,
   });
@@ -35,6 +40,7 @@ class InterfaceInfo {
     ip: m['ip'] as String,
     netmask: m['netmask'] as String?,
     mac: m['mac'] as String?,
+    ipv6: (m['ipv6'] as List?)?.map((e) => e as String).toList() ?? const [],
     isUp: m['isUp'] as bool? ?? false,
     isLoopback: m['isLoopback'] as bool? ?? false,
   );
@@ -202,6 +208,10 @@ class NetworkScanner extends ChangeNotifier {
     notifyListeners();
 
     // --- Phase 1: trigger ARP for every host, then read the table. ---
+    // The IPv6 twin: a datagram to the all-nodes multicast makes every
+    // IPv6 host resolve us (inbound NS), landing it in the kernel NDP
+    // table — replies trickle in during the IPv4 passes below.
+    await _triggerIpv6Ndp(iface);
     RawDatagramSocket? socket;
     try {
       socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
@@ -287,7 +297,12 @@ class NetworkScanner extends ChangeNotifier {
       if (d.isSelf && (d.hostname == null || d.hostname!.isEmpty)) {
         d.hostname = Platform.localHostname.replaceAll(RegExp(r'\.local$'), '');
       }
-      if (d.isSelf) d.nameSource = DeviceNameSource.local;
+      if (d.isSelf) {
+        d.nameSource = DeviceNameSource.local;
+        for (final a in iface.ipv6) {
+          d.addIpv6(a);
+        }
+      }
     }
     found.sort(
       (a, b) =>
@@ -298,6 +313,7 @@ class NetworkScanner extends ChangeNotifier {
     debugPrint(
       'netnatscan: ARP scan found ${found.length} devices on ${iface.cidr ?? iface.ip}',
     );
+    await _applyNdpTable();
     notifyListeners();
 
     // --- Phase 3: enrichment (mDNS + SSDP + PTR + NBNS + latency),
@@ -326,12 +342,14 @@ class NetworkScanner extends ChangeNotifier {
       }
     });
     await Future.wait([mdnsFuture, ssdpFuture]);
+    await _applyNdpTable(); // stragglers from the all-nodes trigger
     await _applyNameCache();
     _startPassiveMdns();
 
     for (final d in devices) {
       debugPrint(
-        'netnatscan: ${d.ip}\t${d.displayName}\t${d.vendor ?? '-'}\t${d.typeLabel}',
+        'netnatscan: ${d.ip}\t${d.displayName}\t${d.vendor ?? '-'}\t'
+        '${d.typeLabel}\t${d.sortedIpv6.join(', ')}',
       );
     }
     devices = [...devices];
@@ -455,12 +473,20 @@ class NetworkScanner extends ChangeNotifier {
       if (svc.host != null) {
         final host = svc.host!.replaceAll(RegExp(r'\.local$'), '');
         for (final ip in svc.resolvedIps) {
+          if (ip.contains(':')) continue;
           _addNameCandidate(ip, host, 30, DeviceNameSource.mdnsHost, type);
           answered.add(ip);
         }
       }
       final ips = svc.resolvedIps.isNotEmpty ? svc.resolvedIps : svc.ips;
+      // AAAA records on a proven SRV host are that device's IPv6
+      // addresses — attach them to whichever device its A records hit.
+      final v6 = [
+        for (final a in ips)
+          if (a.contains(':')) a,
+      ];
       for (final ip in ips) {
+        if (ip.contains(':')) continue;
         _addNameCandidate(
           ip,
           svc.name,
@@ -471,6 +497,9 @@ class NetworkScanner extends ChangeNotifier {
         answered.add(ip);
         final d = byIp[ip];
         if (d == null) continue;
+        for (final a in v6) {
+          d.addIpv6(a);
+        }
         if (type.isNotEmpty) d.mdnsTypes.add(type);
         d.mdnsServices.removeWhere(
           (s) => s.name == svc.name && s.type == svc.type,
@@ -523,6 +552,52 @@ class NetworkScanner extends ChangeNotifier {
     } catch (e) {
       debugPrint('netnatscan: SSDP discovery failed: $e');
     }
+  }
+
+  /// IPv6 twin of the IPv4 UDP blast: datagrams to the all-nodes
+  /// multicast make every IPv6 host resolve us before answering
+  /// (ICMPv6 unreachable → NS), which lands it in the kernel NDP table
+  /// — read back by `getNdpTable`, the same way UDP feeds the ARP dump.
+  /// Sent natively: Dart sockets can't send to a link-scoped multicast.
+  Future<void> _triggerIpv6Ndp(InterfaceInfo iface) async {
+    if (iface.ipv6.isEmpty) return;
+    try {
+      await _channel.invokeMethod('triggerNdp', iface.name);
+    } catch (_) {}
+  }
+
+  /// Kernel IPv6 neighbour (NDP) table → devices, matched by MAC.
+  /// Entries come from the all-nodes trigger plus ambient IPv6 traffic
+  /// (router advertisements, real connections) — the same tier of
+  /// definitive evidence as the ARP table, for v6-capable devices.
+  Future<void> _applyNdpTable() async {
+    List<Map<dynamic, dynamic>> rows;
+    try {
+      rows =
+          await _channel.invokeListMethod<Map<dynamic, dynamic>>(
+            'getNdpTable',
+          ) ??
+          [];
+    } catch (_) {
+      return;
+    }
+    if (rows.isEmpty) return;
+    final byMac = <String, NetworkDevice>{
+      for (final d in devices)
+        if (d.mac != null) d.mac!: d,
+    };
+    var changed = false;
+    for (final row in rows) {
+      final ip = row['ip'] as String?;
+      final mac = row['mac'] as String?;
+      if (ip == null || mac == null) continue;
+      final d = byMac[mac];
+      if (d == null) continue;
+      final before = d.ipv6Addresses.length;
+      d.addIpv6(ip);
+      changed = changed || d.ipv6Addresses.length != before;
+    }
+    if (changed) notifyListeners();
   }
 
   /// NetBIOS node-status per device — Windows/Samba hosts answer with

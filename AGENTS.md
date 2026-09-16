@@ -21,6 +21,11 @@ Flutter macOS app: LAN device scanner in the style of iOS "NetAnalyzer".
    forces kernel ARP resolution; live hosts must answer ARP.
 3. `getArpTable` → sysctl `NET_RT_FLAGS`/`RTF_LLINFO` dump → live devices
    with real MACs (definitive for LAN discovery; catches hosts that ignore ICMP).
+   IPv6 twin: `triggerNdp` sends UDP to all-nodes `ff02::1` (native — Dart
+   can't send link-scoped multicast) so answering hosts land in the NDP
+   table via inbound NS; `getNdpTable` reads the same LLINFO dump with
+   `AF_INET6` → `ipv6Addresses`, matched by MAC. mDNS AAAA records feed
+   `ipv6Addresses` too (SRV host's AAAA attaches to the device its A hits).
 4. Enrichment — every protocol feeds one scored name-candidate pool
    (`_addNameCandidate`/`_finalizeNames`; PTR 40 > UPnP friendlyName 35 >
    host/instance/NetBIOS 30 > HTTP title/UPnP model 22, cryptic penalty,

@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 
 import '../services/mdns_discovery.dart';
@@ -93,6 +95,11 @@ class NetworkDevice {
   String? httpServer;
   String? httpTitle;
 
+  /// IPv6 addresses (link-local `%ifname`-scoped, ULA, global) learned
+  /// from the kernel NDP table — matched by MAC — or the device's own
+  /// mDNS AAAA records.
+  final Set<String> ipv6Addresses = {};
+
   NetworkDevice({
     required this.ip,
     this.hostname,
@@ -106,6 +113,74 @@ class NetworkDevice {
     this.isStandby = false,
     this.nameSource = DeviceNameSource.none,
   });
+
+  /// Adds an IPv6 literal in canonical compressed form so NDP- and
+  /// AAAA-learned duplicates collapse (`fe80:0:0:0:x` == `fe80::x`).
+  /// The same address with and without a `%ifname` zone counts once —
+  /// the scoped spelling is kept since it is the usable literal.
+  void addIpv6(String addr) {
+    final zone = addr.indexOf('%');
+    final core = zone >= 0 ? addr.substring(0, zone) : addr;
+    final suffix = zone >= 0 ? addr.substring(zone) : '';
+    final parsed = InternetAddress.tryParse(core);
+    if (parsed == null || parsed.rawAddress.length != 16) return;
+    final canon = _compressV6(parsed.rawAddress);
+    final dup = ipv6Addresses
+        .where((e) => e.split('%').first == canon)
+        .firstOrNull;
+    if (dup != null) {
+      if (suffix.isNotEmpty && !dup.contains('%')) {
+        ipv6Addresses
+          ..remove(dup)
+          ..add('$canon$suffix');
+      }
+      return;
+    }
+    ipv6Addresses.add('$canon$suffix');
+  }
+
+  /// Global/ULA first, link-local last — those identify the device
+  /// better; fe80::/10 is the per-interface fallback every host has.
+  List<String> get sortedIpv6 {
+    final list = ipv6Addresses.toList();
+    list.sort((a, b) {
+      final la = _isV6LinkLocal(a), lb = _isV6LinkLocal(b);
+      if (la != lb) return la ? 1 : -1;
+      return a.compareTo(b);
+    });
+    return list;
+  }
+
+  static bool _isV6LinkLocal(String a) {
+    final first = int.tryParse(a.split(':').first, radix: 16) ?? 0;
+    return first & 0xffc0 == 0xfe80;
+  }
+
+  /// 16 bytes -> canonical form; the longest zero run (>= 2) -> `::`.
+  static String _compressV6(List<int> b) {
+    final words = [for (var i = 0; i < 8; i++) (b[i * 2] << 8) | b[i * 2 + 1]];
+    var bestStart = -1, bestLen = 0;
+    var i = 0;
+    while (i < 8) {
+      if (words[i] != 0) {
+        i++;
+        continue;
+      }
+      var j = i;
+      while (j < 8 && words[j] == 0) {
+        j++;
+      }
+      if (j - i > bestLen) {
+        bestStart = i;
+        bestLen = j - i;
+      }
+      i = j;
+    }
+    final hex = [for (final w in words) w.toRadixString(16)];
+    if (bestLen < 2) return hex.join(':');
+    return '${hex.sublist(0, bestStart).join(':')}::'
+        '${hex.sublist(bestStart + bestLen).join(':')}';
+  }
 
   DeviceType get type => _classify();
 

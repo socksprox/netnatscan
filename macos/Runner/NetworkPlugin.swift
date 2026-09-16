@@ -23,6 +23,11 @@ class NetworkPlugin: NSObject, FlutterPlugin {
       result(getNetworkInfo())
     case "getArpTable":
       result(getArpTable())
+    case "getNdpTable":
+      result(getNdpTable())
+    case "triggerNdp":
+      triggerNdp(interface: call.arguments as? String)
+      result(nil)
     default:
       result(FlutterMethodNotImplemented)
     }
@@ -31,12 +36,13 @@ class NetworkPlugin: NSObject, FlutterPlugin {
   // MARK: - getNetworkInfo
 
   /// -> {
-  ///   "interfaces": [{"name","ip","netmask","mac"?,"isUp","isLoopback"}],
+  ///   "interfaces": [{"name","ip","netmask","mac"?,"ipv6"?,...}],
   ///   "defaultGateway": String?,
   ///   "defaultInterface": String?
   /// }
   private func getNetworkInfo() -> [String: Any] {
     var macByName: [String: String] = [:]
+    var ipv6ByName: [String: [String]] = [:]
     var interfaces: [[String: Any]] = []
 
     var ifaddrPtr: UnsafeMutablePointer<ifaddrs>?
@@ -56,6 +62,13 @@ class NetworkPlugin: NSObject, FlutterPlugin {
         if let mac = linkAddress(from: sa) {
           macByName[name] = mac
         }
+      } else if family == UInt8(AF_INET6) {
+        let bytes = sa.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) {
+          sin6 in withUnsafeBytes(of: sin6.pointee.sin6_addr) { Array($0) }
+        }
+        if let ip = ipv6String(bytes, scopeIfname: name), ip != "::1" {
+          ipv6ByName[name, default: []].append(ip)
+        }
       } else if family == UInt8(AF_INET) {
         let ip = ipv4String(from: sa)
         var mask: String? = nil
@@ -74,10 +87,14 @@ class NetworkPlugin: NSObject, FlutterPlugin {
       }
     }
 
-    // Attach MACs to IPv4 rows.
+    // Attach MACs + IPv6 addresses to IPv4 rows.
     for i in interfaces.indices {
-      if let mac = macByName[interfaces[i]["name"] as? String ?? ""] {
+      let name = interfaces[i]["name"] as? String ?? ""
+      if let mac = macByName[name] {
         interfaces[i]["mac"] = mac
+      }
+      if let v6 = ipv6ByName[name], !v6.isEmpty {
+        interfaces[i]["ipv6"] = v6
       }
     }
 
@@ -124,15 +141,93 @@ class NetworkPlugin: NSObject, FlutterPlugin {
       var entry: [String: Any] = ["ip": ip, "mac": mac]
       if !dl.name.isEmpty {
         entry["interface"] = dl.name
-      } else {
-        var ifname = [CChar](repeating: 0, count: Int(IFNAMSIZ))
-        if if_indextoname(UInt32(rtm.pointee.rtm_index), &ifname) != nil {
-          entry["interface"] = String(cString: ifname)
-        }
+      } else if let name = ifName(UInt32(rtm.pointee.rtm_index)) {
+        entry["interface"] = name
       }
       entries.append(entry)
     }
     return entries
+  }
+
+  // MARK: - getNdpTable
+
+  /// -> [{"ip","mac","interface"}] — complete IPv6 neighbour (NDP)
+  /// entries, the IPv6 twin of the ARP table. Same RTF_LLINFO dump,
+  /// read with the AF_INET6 MIB.
+  private func getNdpTable() -> [[String: Any]] {
+    guard let dump = routeDump(flags: RTF_LLINFO, family: AF_INET6) else { return [] }
+    var entries: [[String: Any]] = []
+
+    forEachRouteEntry(in: dump) { rtm, addrs in
+      guard let dstOffset = addrs[Int(RTA_DST)],
+        let gwOffset = addrs[Int(RTA_GATEWAY)]
+      else { return }
+
+      guard let addrBytes = sockaddrIn6Bytes(in: dump, at: dstOffset),
+        addrBytes[0] != 0xff, // multicast groups are never neighbours
+        let ip = ipv6String(addrBytes, scopeIfname: nil),
+        ip != "::1"
+      else { return }
+
+      guard let sdlBytes = sockaddrDLBytes(in: dump, at: gwOffset),
+        let dl = parseSockaddrDL(sdlBytes),
+        dl.addr.count == 6
+      else { return }
+
+      let mac = dl.addr.map { String(format: "%02x", $0) }.joined(separator: ":")
+      if mac == "00:00:00:00:00:00" || mac == "ff:ff:ff:ff:ff:ff" { return }
+
+      var entry: [String: Any] = ["ip": ip, "mac": mac]
+      if !dl.name.isEmpty {
+        entry["interface"] = dl.name
+      } else if let name = ifName(UInt32(rtm.pointee.rtm_index)) {
+        entry["interface"] = name
+      }
+      entries.append(entry)
+    }
+    return entries
+  }
+
+  // MARK: - NDP trigger
+
+  /// Sends a few UDP datagrams to the all-nodes multicast (ff02::1) on
+  /// `interface`: every IPv6 host that answers (ICMPv6 unreachable)
+  /// must first resolve us via NS, landing itself in the neighbour
+  /// cache that getNdpTable reads — the IPv6 twin of the IPv4 subnet
+  /// UDP blast that feeds the ARP table. Runs off the platform thread.
+  private func triggerNdp(interface: String?) {
+    guard let interface else { return }
+    let scope = if_nametoindex(interface)
+    guard scope != 0 else { return }
+    DispatchQueue.global().async {
+      let fd = socket(AF_INET6, SOCK_DGRAM, 0)
+      guard fd >= 0 else { return }
+      defer { close(fd) }
+
+      var dst = sockaddr_in6()
+      dst.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+      dst.sin6_family = sa_family_t(AF_INET6)
+      dst.sin6_port = UInt16(44444).bigEndian
+      dst.sin6_scope_id = scope
+      withUnsafeMutableBytes(of: &dst.sin6_addr) { a in
+        a[0] = 0xff
+        a[1] = 0x02
+        a[15] = 0x01
+      }
+      var byte: UInt8 = 0
+      withUnsafePointer(to: &dst) { ptr in
+        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+          for _ in 0..<3 {
+            _ = withUnsafeBytes(of: &byte) { b in
+              sendto(
+                fd, b.baseAddress, 1, 0, sa,
+                socklen_t(MemoryLayout<sockaddr_in6>.size))
+            }
+            usleep(120_000)
+          }
+        }
+      }
+    }
   }
 
   // MARK: - Default route
@@ -180,16 +275,16 @@ class NetworkPlugin: NSObject, FlutterPlugin {
 
   /// Full routing table (all entries, all flags).
   private func fullRouteDump() -> Data? {
-    return sysctlDump(op: NET_RT_DUMP, flags: 0)
+    return sysctlDump(op: NET_RT_DUMP, flags: 0, family: AF_INET)
   }
 
-  /// Neighbour (ARP/LLINFO) table only.
-  private func routeDump(flags: Int32) -> Data? {
-    return sysctlDump(op: NET_RT_FLAGS, flags: flags)
+  /// Neighbour (ARP/NDP LLINFO) table only.
+  private func routeDump(flags: Int32, family: Int32 = AF_INET) -> Data? {
+    return sysctlDump(op: NET_RT_FLAGS, flags: flags, family: family)
   }
 
-  private func sysctlDump(op: Int32, flags: Int32) -> Data? {
-    var mib: [Int32] = [CTL_NET, PF_ROUTE, 0, AF_INET, op, flags]
+  private func sysctlDump(op: Int32, flags: Int32, family: Int32) -> Data? {
+    var mib: [Int32] = [CTL_NET, PF_ROUTE, 0, family, op, flags]
     var needed = 0
     guard sysctl(&mib, UInt32(mib.count), nil, &needed, nil, 0) == 0,
       needed > 0
@@ -247,6 +342,54 @@ class NetworkPlugin: NSObject, FlutterPlugin {
       $0.pointee.sin_addr
     }
     return String(cString: inet_ntoa(addr))
+  }
+
+  private func ifName(_ index: UInt32) -> String? {
+    var buf = [CChar](repeating: 0, count: Int(IFNAMSIZ))
+    guard if_indextoname(index, &buf) != nil else { return nil }
+    return String(cString: buf)
+  }
+
+  /// 16 raw address bytes -> canonical IPv6 string. Link-local
+  /// addresses (fe80::/10) carry their scope embedded in bytes 2-3 in
+  /// the kernel's internal form — strip it and re-attach as `%ifname`
+  /// so the result is a usable literal.
+  private func ipv6String(_ rawBytes: [UInt8], scopeIfname: String?) -> String? {
+    guard rawBytes.count == 16 else { return nil }
+    var bytes = rawBytes
+    var ifname = scopeIfname
+    let linkLocal = bytes[0] == 0xfe && (bytes[1] & 0xc0) == 0x80
+    if linkLocal {
+      let embedded = UInt32(bytes[2]) << 8 | UInt32(bytes[3])
+      if embedded != 0 {
+        bytes[2] = 0
+        bytes[3] = 0
+        ifname = ifname ?? self.ifName(embedded)
+      }
+    }
+    var buf = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+    let ok = bytes.withUnsafeBytes { b in
+      inet_ntop(AF_INET6, b.baseAddress, &buf, socklen_t(buf.count)) != nil
+    }
+    guard ok else { return nil }
+    var ip = String(cString: buf)
+    if linkLocal, let ifname {
+      ip += "%\(ifname)"
+    }
+    return ip
+  }
+
+  /// sin6_addr bytes of the sockaddr_in6 at `offset` in the dump.
+  private func sockaddrIn6Bytes(in data: Data, at offset: Int) -> [UInt8]? {
+    guard offset + MemoryLayout<sockaddr_in6>.size <= data.count else {
+      return nil
+    }
+    return data.withUnsafeBytes { raw -> [UInt8]? in
+      let sa = raw.baseAddress!.advanced(by: offset)
+        .assumingMemoryBound(to: sockaddr.self).pointee
+      guard sa.sa_family == UInt8(AF_INET6) else { return nil }
+      return Array(raw[(offset + 8)..<(offset + 24)])
+    }
   }
 
   private func linkAddress(from sa: UnsafePointer<sockaddr>) -> String? {
