@@ -7,6 +7,7 @@ import '../services/connection_info_service.dart';
 import '../services/network_scanner.dart';
 import '../services/theme_manager.dart' as theme_manager;
 import '../widgets/app_navigation.dart';
+import '../widgets/signal_quality_meter.dart';
 import '../widgets/tdesign.dart';
 
 /// Second tab: everything knowable about the current uplink —
@@ -195,15 +196,17 @@ class _ConnectionInfoScreenState extends State<ConnectionInfoScreen> {
             isDark,
           ),
           _row('PHY mode', wifi.phyMode ?? '—', isDark),
-          _row(
-            'Signal',
-            wifi.rssi != null
-                ? '${wifi.rssi} dBm (${_rssiQuality(wifi.rssi!)})'
-                : '—',
-            isDark,
-          ),
-          _row('Noise', wifi.noise != null ? '${wifi.noise} dBm' : '—', isDark),
-          _row('SNR', wifi.snr != null ? '${wifi.snr} dB' : '—', isDark),
+          if (wifi.rssi != null) ...[
+            _row(
+              'Signal quality',
+              signalQualityLabel(wifi.rssi, wifi.noise),
+              isDark,
+            ),
+            Padding(
+              padding: const EdgeInsets.only(top: 4, bottom: 8),
+              child: SignalQualityMeter(rssi: wifi.rssi!, noise: wifi.noise),
+            ),
+          ],
           _row(
             'Transmit rate',
             wifi.transmitRate != null
@@ -212,7 +215,7 @@ class _ConnectionInfoScreenState extends State<ConnectionInfoScreen> {
             isDark,
           ),
           if (wifi.countryCode != null)
-            _row('Country code', wifi.countryCode!, isDark),
+            _row('Country code', '${wifi.countryCode!} (this device)', isDark),
         ],
       ],
     );
@@ -507,13 +510,6 @@ class _ConnectionInfoScreenState extends State<ConnectionInfoScreen> {
   }
 
   // --- Formatting ---------------------------------------------------------
-
-  String _rssiQuality(int rssi) {
-    if (rssi >= -50) return 'Excellent';
-    if (rssi >= -60) return 'Good';
-    if (rssi >= -70) return 'Fair';
-    return 'Weak';
-  }
 
   String _fmtBytes(int bytes) {
     if (bytes >= 1 << 30) {

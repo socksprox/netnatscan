@@ -123,7 +123,7 @@ class WifiNetwork {
       ssid: m['ssid'] as String?,
       bssid: m['bssid'] as String?,
       rssi: (m['rssi'] as num?)?.toInt(),
-      noise: (m['noise'] as num?)?.toInt(),
+      noise: _plausibleNoise(m['noise']),
       channel: (m['channel'] as num?)?.toInt(),
       band: m['band'] as String?,
       width: m['width'] as String?,
@@ -177,6 +177,13 @@ class WifiNetwork {
 
   int? get snr => (rssi != null && noise != null) ? rssi! - noise! : null;
 
+  /// noiseMeasurement is 0 for BSSes that never reported a floor —
+  /// out-of-range values become null rather than a garbage SNR.
+  static int? _plausibleNoise(dynamic v) {
+    final n = (v as num?)?.toInt();
+    return (n != null && n >= -110 && n <= -20) ? n : null;
+  }
+
   /// 0–4 bars — prefer Apple's normalized signalStrength (private);
   /// fall back to the dBm thresholds the connection tab uses.
   int get bars {
@@ -189,15 +196,6 @@ class WifiNetwork {
     if (r >= -70) return 2;
     if (r >= -80) return 1;
     return 0;
-  }
-
-  String get rssiQuality {
-    final r = rssi;
-    if (r == null) return '—';
-    if (r >= -50) return 'Excellent';
-    if (r >= -60) return 'Good';
-    if (r >= -70) return 'Fair';
-    return 'Weak';
   }
 }
 

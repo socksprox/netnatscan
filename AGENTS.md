@@ -21,8 +21,8 @@ Inventory: `docs/private-apis.md`.
 ## Architecture
 
 `lib/screens/main_navigation_screen.dart` hosts an `IndexedStack` of
-tabs (`ScanScreen`, `WifiNetworksScreen`, `ConnectionInfoScreen`) so
-tab state survives switches. `lib/widgets/app_navigation.dart` is the
+tabs (`ScanScreen`, `WifiNetworksScreen`, `ConnectionInfoScreen`,
+`ToolsScreen`) so tab state survives switches. `lib/widgets/app_navigation.dart` is the
 responsive nav — vertical sidebar ≥ ~1024px wide, `BottomNavigationBar`
 below. Tabs have **no app bar** — each screen has a top-right row
 (theme toggle in narrow layout + refresh button).
@@ -39,6 +39,13 @@ netmasks, and the sandbox blocks subprocesses (`ping`, `arp`).
   Details: `docs/wifi.md`.
 - **Connection** — current uplink: Wi-Fi metadata, interfaces, DNS,
   proxies, DHCP, counters. Details: `docs/wifi.md`.
+- **Tools** — ping (ICMP/UDP/TCP) + traceroute, run entirely in-process
+  in `NetworkPlugin.swift` (`ToolEngine`/`PingJob`/`RouteJob`). Progress
+  streams over EventChannel `netnatscan/tools_events`; run history
+  persists to `tool_history.json`. ICMP uses `SOCK_DGRAM` (sandbox-safe);
+  note macOS prepends the IPv4 header on received datagrams — `icmpOffset`
+  skips it. `SOCK_RAW` is EPERM on this system, so UDP-probe mode falls
+  back to ICMP with a note.
 - **Private API inventory** — verified CoreWLAN private surface +
   `apple80211_var.h` enum ground truth: `docs/private-apis.md`.
 

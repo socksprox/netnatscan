@@ -57,7 +57,7 @@ class WifiInfo {
     security: m['security'] as String?,
     securityDetail: m['securityDetail'] as String?,
     rssi: (m['rssi'] as num?)?.toInt(),
-    noise: (m['noise'] as num?)?.toInt(),
+    noise: _plausibleNoise(m['noise']),
     transmitRate: (m['transmitRate'] as num?)?.toDouble(),
     channel: (m['channel'] as num?)?.toInt(),
     channelBand: m['channelBand'] as String?,
@@ -69,6 +69,13 @@ class WifiInfo {
 
   /// Signal-to-noise ratio in dB — the honest "signal quality" number.
   int? get snr => (rssi != null && noise != null) ? rssi! - noise! : null;
+
+  /// noiseMeasurement can report 0 when no floor was measured —
+  /// out-of-range values become null rather than a garbage SNR.
+  static int? _plausibleNoise(dynamic v) {
+    final n = (v as num?)?.toInt();
+    return (n != null && n >= -110 && n <= -20) ? n : null;
+  }
 }
 
 /// One interface's kernel counters (if_data64 via NET_RT_IFLIST2) —

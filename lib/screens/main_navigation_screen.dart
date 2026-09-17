@@ -4,6 +4,7 @@ import '../services/theme_manager.dart' as theme_manager;
 import '../widgets/app_navigation.dart';
 import 'connection_info_screen.dart';
 import 'scan_screen.dart';
+import 'tools_screen.dart';
 import 'wifi_networks_screen.dart';
 
 /// App shell: IndexedStack of tabs behind a responsive AppNavigation —
@@ -35,12 +36,18 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
       activeIcon: Icons.info,
       label: 'Connection',
     ),
+    NavItemSpec(
+      icon: Icons.handyman_outlined,
+      activeIcon: Icons.handyman,
+      label: 'Tools',
+    ),
   ];
 
   static const _tabs = [
     ScanScreen(),
     WifiNetworksScreen(),
     ConnectionInfoScreen(),
+    ToolsScreen(),
   ];
 
   void _cycleTheme() {

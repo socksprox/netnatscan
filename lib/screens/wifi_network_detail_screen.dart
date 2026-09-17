@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 import '../services/theme_manager.dart' as theme_manager;
 import '../services/wifi_networks_service.dart';
 import '../widgets/custom_app_bar.dart';
+import '../widgets/signal_quality_meter.dart';
 import '../widgets/tdesign.dart';
 
 /// Everything one scan learned about a single BSS — public fields plus
@@ -69,24 +70,34 @@ class WifiNetworkDetailScreen extends StatelessWidget {
             ('Connected', n.isCurrent ? 'Yes' : 'No'),
             if (n.wasConnectedDuringSleep) ('Connected during sleep', 'Yes'),
           ]),
-          _group(context, isDark, 'Signal', [
-            if (n.rssi != null) ('RSSI', '${n.rssi} dBm (${n.rssiQuality})'),
-            if (n.noise != null) ('Noise', '${n.noise} dBm'),
-            if (n.snr != null) ('SNR', '${n.snr} dB'),
-            if (n.signalStrength != null)
-              (
-                'Signal strength',
-                '${(n.signalStrength! * 100).toStringAsFixed(0)}%',
-              ),
-            if (n.phyFastest != null) ('Fastest PHY', n.phyFastest!),
-            if (n.phySupported != null)
-              ('Supported PHY modes', n.phySupported!),
-            if (n.maxStreams != null)
-              ('Spatial streams', 'up to ${n.maxStreams}'),
-            if (n.vhtMaxWidth != null) ('VHT max width', n.vhtMaxWidth!),
-            if (n.rates.isNotEmpty)
-              ('Basic rates', '${n.rates.join(', ')} Mb/s'),
-          ]),
+          _group(
+            context,
+            isDark,
+            'Signal',
+            [
+              if (n.rssi != null)
+                ('Signal quality', signalQualityLabel(n.rssi, n.noise)),
+              if (n.signalStrength != null)
+                (
+                  'Signal strength',
+                  '${(n.signalStrength! * 100).toStringAsFixed(0)}%',
+                ),
+              if (n.phyFastest != null) ('Fastest PHY', n.phyFastest!),
+              if (n.phySupported != null)
+                ('Supported PHY modes', n.phySupported!),
+              if (n.maxStreams != null)
+                ('Spatial streams', 'up to ${n.maxStreams}'),
+              if (n.vhtMaxWidth != null) ('VHT max width', n.vhtMaxWidth!),
+              if (n.rates.isNotEmpty)
+                ('Basic rates', '${n.rates.join(', ')} Mb/s'),
+            ],
+            footer: n.rssi != null
+                ? Padding(
+                    padding: const EdgeInsets.only(top: 4),
+                    child: SignalQualityMeter(rssi: n.rssi!, noise: n.noise),
+                  )
+                : null,
+          ),
           _group(context, isDark, 'Security', [
             ('Security', n.securityDetail ?? n.security),
             if (n.securityDetail != null) ('Coarse (public API)', n.security),
@@ -110,7 +121,8 @@ class WifiNetworkDetailScreen extends StatelessWidget {
               if (n.displayName != null) ('Display name', n.displayName!),
               if (n.friendlyName != null) ('Friendly name', n.friendlyName!),
               if (n.deviceID != null) ('Device ID', n.deviceID!),
-              if (n.countryCode != null) ('Country code', n.countryCode!),
+              if (n.countryCode != null)
+                ('Country code', '${n.countryCode!} (this router)'),
               if (n.venueGroup != null) ('Venue group', '${n.venueGroup}'),
               if (n.venueType != null) ('Venue type', '${n.venueType}'),
               if (n.operatorFriendlyNames.isNotEmpty)
@@ -208,15 +220,17 @@ class WifiNetworkDetailScreen extends StatelessWidget {
     );
   }
 
-  /// A section card of copyable key/value rows (null entries dropped).
+  /// A section card of copyable key/value rows (null entries dropped),
+  /// with an optional non-row widget appended inside the card.
   Widget _group(
     BuildContext context,
     bool isDark,
     String title,
-    List<(String, String)?> rows,
-  ) {
+    List<(String, String)?> rows, {
+    Widget? footer,
+  }) {
     final items = rows.whereType<(String, String)>().toList();
-    if (items.isEmpty) return const SizedBox.shrink();
+    if (items.isEmpty && footer == null) return const SizedBox.shrink();
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -238,8 +252,9 @@ class WifiNetworkDetailScreen extends StatelessWidget {
                   items[i].$1,
                   items[i].$2,
                   isDark,
-                  last: i == items.length - 1,
+                  last: i == items.length - 1 && footer == null,
                 ),
+              ?footer,
             ],
           ),
         ),

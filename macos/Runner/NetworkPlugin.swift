@@ -12,12 +12,18 @@ import SystemConfiguration
 /// subprocesses, no raw-socket privileges.
 class NetworkPlugin: NSObject, FlutterPlugin {
   static let channelName = "netnatscan/network"
+  static let eventsChannelName = "netnatscan/tools_events"
+
+  private let toolEngine = ToolEngine()
 
   static func register(with registrar: FlutterPluginRegistrar) {
     let channel = FlutterMethodChannel(
       name: channelName, binaryMessenger: registrar.messenger)
     let instance = NetworkPlugin()
     registrar.addMethodCallDelegate(instance, channel: channel)
+    let events = FlutterEventChannel(
+      name: eventsChannelName, binaryMessenger: registrar.messenger)
+    events.setStreamHandler(instance.toolEngine)
   }
 
   func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
@@ -30,6 +36,12 @@ class NetworkPlugin: NSObject, FlutterPlugin {
       result(getNdpTable())
     case "triggerNdp":
       triggerNdp(interface: call.arguments as? String)
+      result(nil)
+    case "startPing", "startRoute":
+      let args = call.arguments as? [String: Any] ?? [:]
+      result(toolEngine.start(call.method, args))
+    case "stopTool":
+      toolEngine.stop()
       result(nil)
     case "getConnectionInfo":
       result(getConnectionInfo())
@@ -1268,5 +1280,951 @@ class NetworkPlugin: NSObject, FlutterPlugin {
       bytes: nameBytes.prefix(while: { $0 != 0 }), encoding: .utf8) ?? ""
     let addr = Array(bytes[(8 + nlen)..<(8 + nlen + alen)])
     return (name, addr, Int(dl.sdl_type))
+  }
+}
+
+// MARK: - Tools (ping / route)
+
+/// Ping/route job engine. MethodChannel calls only launch or stop a
+/// job; progress streams over the `netnatscan/tools_events`
+/// EventChannel as {type: start|reply|timeout|note|hop|hopName|done}
+/// maps. Everything runs in-process on BSD sockets:
+///  - ICMP ping/probes: SOCK_DGRAM ICMP (the SimplePing mechanism —
+///    works inside the App Sandbox, no privileges needed).
+///  - UDP ping: connected UDP socket; the host's ICMP port-unreachable
+///    comes back as ECONNREFUSED on recv.
+///  - TCP ping: nonblocking connect(); ECONNREFUSED also means alive.
+///  - Route probes: IP_TTL/IPV6_UNICAST_HOPS per probe; time-exceeded
+///    errors are collected on the dgram socket (kernel demuxes errors
+///    quoting our echo to it) plus, when available, a raw ICMP socket —
+///    required for UDP-probe mode and usually denied by the sandbox.
+private final class ToolEngine: NSObject, FlutterStreamHandler {
+  private var sink: FlutterEventSink?
+  private var job: ToolJob?
+
+  func onListen(
+    withArguments arguments: Any?,
+    eventSink events: @escaping FlutterEventSink
+  ) -> FlutterError? {
+    sink = events
+    return nil
+  }
+
+  func onCancel(withArguments arguments: Any?) -> FlutterError? {
+    sink = nil
+    return nil
+  }
+
+  /// FlutterEventSink isn't thread-safe — hop to the main queue.
+  func emit(_ event: [String: Any]) {
+    DispatchQueue.main.async { [weak self] in self?.sink?(event) }
+  }
+
+  func start(_ method: String, _ args: [String: Any]) -> [String: Any] {
+    stop()
+    guard
+      let host = (args["host"] as? String)?
+        .trimmingCharacters(in: .whitespacesAndNewlines),
+      !host.isEmpty
+    else { return ["ok": false, "message": "Missing target host"] }
+    let job: ToolJob =
+      method == "startPing"
+      ? PingJob(args: args, host: host, engine: self)
+      : RouteJob(args: args, host: host, engine: self)
+    self.job = job
+    job.start()
+    return ["ok": true]
+  }
+
+  func stop() {
+    job?.cancel()
+    job = nil
+  }
+}
+
+/// Socket options that are either absent from the SDK headers or
+/// clearer when named after what they do here.
+private enum ToolS {
+  static let ipTtl: Int32 = 4 // IP_TTL
+  static let v6Hops: Int32 = 4 // IPV6_UNICAST_HOPS
+  static let ipDontFrag: Int32 = 67 // IP_DONTFRAG
+  static let v6DontFrag: Int32 = 61 // IPV6_DONTFRAG
+}
+
+private class ToolJob {
+  let args: [String: Any]
+  let host: String
+  let jobId: Int
+  weak var engine: ToolEngine?
+
+  private let lock = NSLock()
+  private var _cancelled = false
+  private var fds: [Int32] = []
+
+  init(args: [String: Any], host: String, engine: ToolEngine) {
+    self.args = args
+    self.host = host
+    self.engine = engine
+    self.jobId = (args["job"] as? Int) ?? 0
+  }
+
+  var cancelled: Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return _cancelled
+  }
+
+  func track(_ fd: Int32) {
+    lock.lock()
+    fds.append(fd)
+    lock.unlock()
+  }
+
+  func untrack(_ fd: Int32) {
+    lock.lock()
+    fds.removeAll { $0 == fd }
+    lock.unlock()
+  }
+
+  /// Closing tracked fds unblocks an in-flight poll/recv on the job
+  /// queue so stop is near-instant.
+  func cancel() {
+    lock.lock()
+    _cancelled = true
+    let open = fds
+    fds.removeAll()
+    lock.unlock()
+    for fd in open { close(fd) }
+  }
+
+  func emit(_ event: [String: Any]) {
+    var e = event
+    e["job"] = jobId
+    engine?.emit(e)
+  }
+
+  func emitError(_ message: String) {
+    emit(["type": "done", "reason": "error", "message": message])
+  }
+
+  func start() {
+    DispatchQueue.global(qos: .userInitiated).async { [self] in run() }
+  }
+
+  func run() {}
+
+  func intArg(_ key: String, _ def: Int) -> Int {
+    (args[key] as? Int) ?? def
+  }
+
+  // MARK: sockaddr / DNS helpers
+
+  /// getaddrinfo → sockaddr_storage. 'auto' prefers IPv4.
+  func resolve(
+    _ host: String, family: String, sockType: Int32
+  ) -> (sockaddr_storage, socklen_t)? {
+    var hints = addrinfo()
+    hints.ai_family =
+      family == "ipv4" ? AF_INET : family == "ipv6" ? AF_INET6 : AF_UNSPEC
+    hints.ai_socktype = sockType
+    var res: UnsafeMutablePointer<addrinfo>?
+    guard getaddrinfo(host, nil, &hints, &res) == 0, let first = res
+    else { return nil }
+    defer { freeaddrinfo(res) }
+    var chosen = first
+    if hints.ai_family == AF_UNSPEC {
+      var cur: UnsafeMutablePointer<addrinfo>? = first
+      while let c = cur {
+        if c.pointee.ai_family == AF_INET {
+          chosen = c
+          break
+        }
+        cur = c.pointee.ai_next
+      }
+    }
+    var ss = sockaddr_storage()
+    memset(&ss, 0, MemoryLayout<sockaddr_storage>.size)
+    memcpy(&ss, chosen.pointee.ai_addr, Int(chosen.pointee.ai_addrlen))
+    return (ss, chosen.pointee.ai_addrlen)
+  }
+
+  /// sockaddr_storage for a numeric IP literal (for reverse DNS).
+  func sockaddrFromIp(_ ip: String) -> (sockaddr_storage, socklen_t)? {
+    let bare = ip.split(separator: "%").first.map(String.init) ?? ip
+    var ss = sockaddr_storage()
+    memset(&ss, 0, MemoryLayout<sockaddr_storage>.size)
+    if bare.contains(":") {
+      let ok = withUnsafeMutablePointer(to: &ss) { p in
+        p.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { v6 in
+          v6.pointee.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+          v6.pointee.sin6_family = sa_family_t(AF_INET6)
+          return inet_pton(AF_INET6, bare, &v6.pointee.sin6_addr) == 1
+        }
+      }
+      return ok ? (ss, socklen_t(MemoryLayout<sockaddr_in6>.size)) : nil
+    }
+    let ok = withUnsafeMutablePointer(to: &ss) { p in
+      p.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { v4 in
+        v4.pointee.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        v4.pointee.sin_family = sa_family_t(AF_INET)
+        return inet_pton(AF_INET, bare, &v4.pointee.sin_addr) == 1
+      }
+    }
+    return ok ? (ss, socklen_t(MemoryLayout<sockaddr_in>.size)) : nil
+  }
+
+  /// getnameinfo(NI_NUMERICHOST) — canonical literal for the address.
+  func ipString(_ ss: sockaddr_storage) -> String? {
+    var copy = ss
+    var buf = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+    let r = withUnsafePointer(to: &copy) { p in
+      p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+        getnameinfo(
+          sa, socklen_t(sa.pointee.sa_len), &buf,
+          socklen_t(buf.count), nil, 0, NI_NUMERICHOST)
+      }
+    }
+    return r == 0 ? String(cString: buf) : nil
+  }
+
+  /// getnameinfo(NI_NAMEREQD) — reverse DNS; may block on the network,
+  /// so callers run it off the job queue.
+  func reverseName(_ ss: sockaddr_storage) -> String? {
+    var copy = ss
+    var buf = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+    let r = withUnsafePointer(to: &copy) { p in
+      p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+        getnameinfo(
+          sa, socklen_t(sa.pointee.sa_len), &buf,
+          socklen_t(buf.count), nil, 0, NI_NAMEREQD)
+      }
+    }
+    guard r == 0 else { return nil }
+    let name = String(cString: buf)
+    return name.isEmpty ? nil : name
+  }
+
+  /// Same address, ignoring port — the "is this the target?" test.
+  func sameAddr(_ a: sockaddr_storage, _ b: sockaddr_storage) -> Bool {
+    guard a.ss_family == b.ss_family else { return false }
+    var x = a
+    var y = b
+    if a.ss_family == sa_family_t(AF_INET) {
+      return withUnsafePointer(to: &x) { xp in
+        xp.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { xi in
+          withUnsafePointer(to: &y) { yp in
+            yp.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { yi in
+              xi.pointee.sin_addr.s_addr == yi.pointee.sin_addr.s_addr
+            }
+          }
+        }
+      }
+    }
+    return withUnsafePointer(to: &x) { xp in
+      xp.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { xi in
+        withUnsafePointer(to: &y) { yp in
+          yp.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { yi in
+            withUnsafeBytes(of: xi.pointee.sin6_addr) { xb in
+              withUnsafeBytes(of: yi.pointee.sin6_addr) { yb in
+                memcmp(xb.baseAddress, yb.baseAddress, 16) == 0
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  func setPort(_ ss: inout sockaddr_storage, _ port: UInt16) {
+    if ss.ss_family == sa_family_t(AF_INET) {
+      withUnsafeMutablePointer(to: &ss) { p in
+        p.withMemoryRebound(to: sockaddr_in.self, capacity: 1) {
+          $0.pointee.sin_port = port.bigEndian
+        }
+      }
+    } else {
+      withUnsafeMutablePointer(to: &ss) { p in
+        p.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) {
+          $0.pointee.sin6_port = port.bigEndian
+        }
+      }
+    }
+  }
+
+  // MARK: socket I/O
+
+  func setSockOptInt(_ fd: Int32, _ level: Int32, _ name: Int32, _ value: Int32) {
+    var v = value
+    setsockopt(fd, level, name, &v, socklen_t(MemoryLayout<Int32>.size))
+  }
+
+  func sendTo(
+    _ fd: Int32, _ bytes: [UInt8],
+    _ ss: sockaddr_storage, _ len: socklen_t
+  ) -> Int {
+    var copy = ss
+    return bytes.withUnsafeBufferPointer { buf in
+      withUnsafePointer(to: &copy) { p in
+        p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+          Darwin.sendto(fd, buf.baseAddress, buf.count, 0, sa, len)
+        }
+      }
+    }
+  }
+
+  /// poll() for readability; nil on timeout, error or a closed fd
+  /// (cancel surfaces as POLLNVAL, i.e. no POLLIN).
+  func pollReadable(_ fds: [Int32], timeoutMs: Int) -> [Int32]? {
+    var pfds = fds.map {
+      pollfd(fd: $0, events: Int16(POLLIN), revents: 0)
+    }
+    let r = poll(&pfds, nfds_t(pfds.count), Int32(max(timeoutMs, 0)))
+    guard r > 0 else { return nil }
+    return (0..<pfds.count).compactMap {
+      pfds[$0].revents & Int16(POLLIN) != 0 ? fds[$0] : nil
+    }
+  }
+
+  struct Incoming {
+    var bytes: [UInt8]
+    var src: sockaddr_storage
+  }
+
+  /// recvfrom() — payload plus the source sockaddr.
+  func recvNow(_ fd: Int32) -> Incoming? {
+    var buf = [UInt8](repeating: 0, count: 4096)
+    var src = sockaddr_storage()
+    var srcLen = socklen_t(MemoryLayout<sockaddr_storage>.size)
+    let n = buf.withUnsafeMutableBytes { bb in
+      withUnsafeMutablePointer(to: &src) { sp in
+        sp.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+          recvfrom(fd, bb.baseAddress, bb.count, 0, sa, &srcLen)
+        }
+      }
+    }
+    guard n > 0 else { return nil }
+    return Incoming(bytes: Array(buf[0..<n]), src: src)
+  }
+
+  func soError(_ fd: Int32) -> Int32 {
+    var err: Int32 = 0
+    var len = socklen_t(MemoryLayout<Int32>.size)
+    getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len)
+    return err
+  }
+
+  func errnoString() -> String {
+    String(cString: strerror(errno))
+  }
+
+  func beep(_ name: String) {
+    DispatchQueue.main.async {
+      NSSound(named: NSSound.Name(name))?.play()
+    }
+  }
+
+  // MARK: ICMP packets
+
+  /// ICMP(v6) echo request: 8-byte header + `payload` bytes. The kernel
+  /// rewrites the identifier on SOCK_DGRAM sockets (and checksums for
+  /// v6), so replies/errors are correlated by sequence number only.
+  func buildEcho(seq: Int, v6: Bool, payload: Int) -> [UInt8] {
+    let n = 8 + max(payload, 0)
+    var pkt = [UInt8](repeating: 0, count: n)
+    pkt[0] = v6 ? 128 : 8
+    pkt[6] = UInt8((seq >> 8) & 0xff)
+    pkt[7] = UInt8(seq & 0xff)
+    for i in 8..<n { pkt[i] = UInt8(i & 0xff) }
+    if !v6 {
+      let c = icmpCksum(pkt)
+      pkt[2] = UInt8(c >> 8)
+      pkt[3] = UInt8(c & 0xff)
+    }
+    return pkt
+  }
+
+  func icmpCksum(_ bytes: [UInt8]) -> UInt16 {
+    var sum: UInt32 = 0
+    var i = 0
+    while i + 1 < bytes.count {
+      sum += UInt32(bytes[i]) << 8 | UInt32(bytes[i + 1])
+      i += 2
+    }
+    if i < bytes.count { sum += UInt32(bytes[i]) << 8 }
+    while sum >> 16 != 0 { sum = (sum & 0xffff) + (sum >> 16) }
+    return ~UInt16(truncatingIfNeeded: sum)
+  }
+
+  /// Byte offset of the ICMP(v6) message in a received datagram — or
+  /// -1 if it doesn't look like IP/ICMP. macOS SOCK_DGRAM ICMP sockets
+  /// prepend the IPv4 header (first nibble 4); iOS-style dgram sockets
+  /// and IPv6 raw sockets deliver the ICMP message at offset 0.
+  func icmpOffset(_ b: [UInt8]) -> Int {
+    guard b.count >= 8 else { return -1 }
+    switch b[0] >> 4 {
+    case 4:
+      let ihl = Int(b[0] & 0x0f) * 4
+      return ihl >= 20 && b.count > ihl ? ihl : -1
+    case 6:
+      // Full IPv6 header — only when it actually carries ICMPv6.
+      return b.count > 46 && b[6] == 58 ? 40 : -1
+    default:
+      return 0
+    }
+  }
+
+  /// Parse an ICMP(v6) message at `bytes[off...]` (see icmpOffset).
+  /// Returns (probe index, isEchoReply) — echo replies carry their seq;
+  /// errors carry the embedded probe's echo seq, or its UDP dport minus
+  /// `udpBasePort` for UDP-probe mode.
+  func parseIcmp(
+    _ b: [UInt8], off: Int, v6: Bool, udpBasePort: Int?
+  ) -> (idx: Int, isReply: Bool)? {
+    guard off >= 0, b.count >= off + 8 else { return nil }
+    let type = b[off]
+    if type == (v6 ? 129 : 0) {
+      return (Int(b[off + 6]) << 8 | Int(b[off + 7]), true)
+    }
+    let isErr = v6 ? (type == 3 || type == 1) : (type == 11 || type == 3)
+    guard isErr else { return nil }
+    let emb = off + 8
+    var idx = -1
+    if !v6 {
+      guard emb + 28 <= b.count else { return nil }
+      let ihl = Int(b[emb] & 0x0f) * 4
+      guard ihl >= 20, emb + ihl + 8 <= b.count else { return nil }
+      let l4 = emb + ihl
+      let proto = b[emb + 9]
+      if proto == 1 && b[l4] == 8 {
+        idx = Int(b[l4 + 6]) << 8 | Int(b[l4 + 7])
+      } else if proto == 17, let base = udpBasePort {
+        idx = (Int(b[l4 + 2]) << 8 | Int(b[l4 + 3])) - base
+      }
+    } else {
+      guard emb + 48 <= b.count else { return nil }
+      let l4 = emb + 40
+      let proto = b[emb + 6]
+      if proto == 58 && b[l4] == 128 {
+        idx = Int(b[l4 + 6]) << 8 | Int(b[l4 + 7])
+      } else if proto == 17, let base = udpBasePort {
+        idx = (Int(b[l4 + 2]) << 8 | Int(b[l4 + 3])) - base
+      }
+    }
+    guard idx >= 0 else { return nil }
+    return (idx, false)
+  }
+}
+
+private final class PingJob: ToolJob {
+  override func run() {
+    let family = args["ipVersion"] as? String ?? "auto"
+    let proto = args["protocol"] as? String ?? "icmp"
+    let count = intArg("count", 5)
+    let interval = intArg("intervalMs", 1000)
+    let payload = intArg("payloadBytes", 56)
+    let port = intArg("port", proto == "udp" ? 7 : 80)
+    let dontFrag = args["dontFragment"] as? Bool ?? false
+    let audible = args["audible"] as? Bool ?? false
+
+    guard
+      let (dst, dstLen) = resolve(
+        host, family: family,
+        sockType: proto == "tcp" ? SOCK_STREAM : SOCK_DGRAM)
+    else {
+      emitError("Could not resolve '\(host)'")
+      return
+    }
+    let v6 = dst.ss_family == sa_family_t(AF_INET6)
+    emit([
+      "type": "start",
+      "tool": "ping",
+      "target": host,
+      "resolved": ipString(dst) ?? host,
+      "detail": args["detail"] as? String ?? "",
+    ])
+
+    switch proto {
+    case "udp":
+      runUdp(
+        dst: dst, dstLen: dstLen, v6: v6, count: count,
+        interval: interval, port: port, audible: audible)
+    case "tcp":
+      runTcp(
+        dst: dst, dstLen: dstLen, v6: v6, count: count,
+        interval: interval, port: port, audible: audible)
+    default:
+      runIcmp(
+        dst: dst, dstLen: dstLen, v6: v6, count: count,
+        interval: interval, payload: payload, dontFrag: dontFrag,
+        audible: audible)
+    }
+  }
+
+  private func finishPing(sent: Int, rtts: [Double]) {
+    var e: [String: Any] = [
+      "type": "done",
+      "reason": cancelled ? "stopped" : "finished",
+      "sent": sent,
+      "received": rtts.count,
+      "lossPct": sent > 0
+        ? Double(sent - rtts.count) / Double(sent) * 100 : 0.0,
+    ]
+    if let mn = rtts.min(), let mx = rtts.max(), !rtts.isEmpty {
+      e["minMs"] = mn
+      e["maxMs"] = mx
+      e["avgMs"] = rtts.reduce(0, +) / Double(rtts.count)
+    }
+    emit(e)
+  }
+
+  private func emitReply(
+    _ seq: Int, _ from: String, _ rtt: Double,
+    _ status: String?, _ audible: Bool
+  ) {
+    var ev: [String: Any] = [
+      "type": "reply",
+      "seq": seq,
+      "from": from,
+      "rttMs": rtt,
+    ]
+    if let status { ev["status"] = status }
+    emit(ev)
+    if audible { beep("Ping") }
+  }
+
+  /// ICMP echo via SOCK_DGRAM — the kernel picks/rewrites the
+  /// identifier, so probes are correlated by seq; each probe waits up
+  /// to `interval` ms for a reply, which also sets the probe cadence.
+  private func runIcmp(
+    dst: sockaddr_storage, dstLen: socklen_t, v6: Bool,
+    count: Int, interval: Int, payload: Int,
+    dontFrag: Bool, audible: Bool
+  ) {
+    let fd = socket(
+      v6 ? AF_INET6 : AF_INET, SOCK_DGRAM,
+      v6 ? IPPROTO_ICMPV6 : IPPROTO_ICMP)
+    guard fd >= 0 else {
+      emitError("ICMP socket failed: \(errnoString())")
+      return
+    }
+    track(fd)
+    defer { untrack(fd); close(fd) }
+
+    if dontFrag {
+      setSockOptInt(
+        fd, v6 ? IPPROTO_IPV6 : IPPROTO_IP,
+        v6 ? ToolS.v6DontFrag : ToolS.ipDontFrag, 1)
+    }
+
+    var sendTimes = [Int: Date]()
+    var rtts = [Double]()
+    var sent = 0
+
+    for seq in 0..<count {
+      if cancelled { break }
+      let pkt = buildEcho(seq: seq, v6: v6, payload: payload)
+      let t0 = Date()
+      if sendTo(fd, pkt, dst, dstLen) < 0 {
+        emit(["type": "note", "message": "send failed: \(errnoString())"])
+      }
+      sent += 1
+      sendTimes[seq] = t0
+      let deadline = t0.addingTimeInterval(TimeInterval(interval) / 1000)
+      var answered = false
+      while !cancelled && !answered {
+        let remain = Int(deadline.timeIntervalSinceNow * 1000)
+        if remain <= 0 { break }
+        guard let ready = pollReadable([fd], timeoutMs: remain),
+          !ready.isEmpty, let msg = recvNow(fd)
+        else { break }
+        guard
+          let m = parseIcmp(
+            msg.bytes, off: icmpOffset(msg.bytes), v6: v6,
+            udpBasePort: nil)
+        else { continue }
+        switch m {
+        case (let s, true):
+          // seq-matched echo reply; a late one for an earlier probe
+          // still counts (Dart upserts it over the timeout row).
+          if let t = sendTimes.removeValue(forKey: s) {
+            emitReply(
+              s, ipString(msg.src) ?? "",
+              Date().timeIntervalSince(t) * 1000, nil, audible)
+            rtts.append(Date().timeIntervalSince(t) * 1000)
+            if s == seq { answered = true }
+          }
+        case (let idx, false):
+          if sendTimes[idx] != nil {
+            emit([
+              "type": "note",
+              "message": "seq \(idx): destination unreachable",
+            ])
+          }
+        }
+      }
+      if !answered && !cancelled {
+        emit(["type": "timeout", "seq": seq])
+        if audible { beep("Funk") }
+      }
+    }
+    finishPing(sent: sent, rtts: rtts)
+  }
+
+  /// UDP ping — a datagram to a (usually closed) port; the host's ICMP
+  /// port-unreachable lands as ECONNREFUSED on the connected socket.
+  /// One fresh socket per probe keeps error delivery clean.
+  private func runUdp(
+    dst: sockaddr_storage, dstLen: socklen_t, v6: Bool,
+    count: Int, interval: Int, port: Int, audible: Bool
+  ) {
+    var rtts = [Double]()
+    var sent = 0
+    for seq in 0..<count {
+      if cancelled { break }
+      let fd = socket(v6 ? AF_INET6 : AF_INET, SOCK_DGRAM, 0)
+      guard fd >= 0 else {
+        emitError("UDP socket failed: \(errnoString())")
+        return
+      }
+      track(fd)
+      var d = dst
+      setPort(&d, UInt16(port))
+      let t0 = Date()
+      let connected = withUnsafePointer(to: &d) { p in
+        p.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+          connect(fd, $0, dstLen)
+        }
+      }
+      var answered = false
+      if connected == 0 {
+        var byte: UInt8 = 0
+        let n = withUnsafeBytes(of: &byte) { send(fd, $0.baseAddress, 1, 0) }
+        if n >= 0 {
+          sent += 1
+          if let ready = pollReadable([fd], timeoutMs: interval),
+            !ready.isEmpty
+          {
+            var buf = [UInt8](repeating: 0, count: 64)
+            let r = recv(fd, &buf, buf.count, 0)
+            let rtt = Date().timeIntervalSince(t0) * 1000
+            if r > 0 {
+              emitReply(seq, ipString(d) ?? "", rtt, "data", audible)
+              rtts.append(rtt)
+              answered = true
+            } else {
+              let err = errno
+              if err == ECONNREFUSED || soError(fd) == ECONNREFUSED {
+                emitReply(
+                  seq, ipString(d) ?? "", rtt, "port unreachable", audible)
+                rtts.append(rtt)
+                answered = true
+              }
+            }
+          }
+        }
+      } else {
+        emit([
+          "type": "note",
+          "message": "connect failed: \(errnoString())",
+        ])
+      }
+      untrack(fd)
+      close(fd)
+      if !answered && !cancelled {
+        emit(["type": "timeout", "seq": seq])
+        if audible { beep("Funk") }
+      }
+      // Hold the probe cadence for the rest of the interval.
+      let rest = interval - Int(Date().timeIntervalSince(t0) * 1000)
+      if rest > 0 && !cancelled { usleep(UInt32(rest * 1000)) }
+    }
+    finishPing(sent: sent, rtts: rtts)
+  }
+
+  /// TCP ping — a nonblocking connect(); completing or being refused
+  /// both prove the host is up, timeout means filtered/down.
+  private func runTcp(
+    dst: sockaddr_storage, dstLen: socklen_t, v6: Bool,
+    count: Int, interval: Int, port: Int, audible: Bool
+  ) {
+    var rtts = [Double]()
+    var sent = 0
+    for seq in 0..<count {
+      if cancelled { break }
+      let fd = socket(v6 ? AF_INET6 : AF_INET, SOCK_STREAM, 0)
+      guard fd >= 0 else {
+        emitError("TCP socket failed: \(errnoString())")
+        return
+      }
+      track(fd)
+      let flags = fcntl(fd, F_GETFL, 0)
+      _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+      var d = dst
+      setPort(&d, UInt16(port))
+      let t0 = Date()
+      let cr = withUnsafePointer(to: &d) { p in
+        p.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+          connect(fd, $0, dstLen)
+        }
+      }
+      sent += 1
+      var answered = false
+      if cr == 0 {
+        emitReply(seq, ipString(d) ?? "", 0, "connected", audible)
+        rtts.append(0)
+        answered = true
+      } else if errno == EINPROGRESS {
+        var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+        if poll(&pfd, 1, Int32(interval)) > 0 {
+          let err = soError(fd)
+          let rtt = Date().timeIntervalSince(t0) * 1000
+          if err == 0 {
+            emitReply(seq, ipString(d) ?? "", rtt, "connected", audible)
+            rtts.append(rtt)
+            answered = true
+          } else if err == ECONNREFUSED {
+            emitReply(seq, ipString(d) ?? "", rtt, "reset", audible)
+            rtts.append(rtt)
+            answered = true
+          }
+        }
+      } else {
+        emit([
+          "type": "note",
+          "message": "connect failed: \(errnoString())",
+        ])
+      }
+      untrack(fd)
+      close(fd)
+      if !answered && !cancelled {
+        emit(["type": "timeout", "seq": seq])
+        if audible { beep("Funk") }
+      }
+      let rest = interval - Int(Date().timeIntervalSince(t0) * 1000)
+      if rest > 0 && !cancelled { usleep(UInt32(rest * 1000)) }
+    }
+    finishPing(sent: sent, rtts: rtts)
+  }
+}
+
+private final class RouteJob: ToolJob {
+  private let udpBasePort = 33434
+  private var hopResults = [Int: [[String: Any]?]]()
+  private var nameCache = [String: String]()
+
+  override func run() {
+    let family = args["ipVersion"] as? String ?? "auto"
+    var udp = args["udpProbes"] as? Bool ?? false
+    let maxHops = intArg("maxHops", 30)
+    let pph = intArg("probesPerHop", 3)
+    let maxDelay = intArg("maxDelayMs", 2000)
+    let minDelay = intArg("minDelayMs", 100)
+
+    guard
+      let (dst, dstLen) = resolve(host, family: family, sockType: SOCK_DGRAM)
+    else {
+      emitError("Could not resolve '\(host)'")
+      return
+    }
+    let v6 = dst.ss_family == sa_family_t(AF_INET6)
+    let resolvedIp = ipString(dst) ?? host
+
+    // Receivers: the dgram ICMP socket doubles as the sender in ICMP
+    // mode and still gets errors quoting our echoes; the raw socket is
+    // required to see errors quoting UDP probes (usually denied by the
+    // sandbox — degrading to ICMP keeps the tool working).
+    let icmpFd = socket(
+      v6 ? AF_INET6 : AF_INET, SOCK_DGRAM,
+      v6 ? IPPROTO_ICMPV6 : IPPROTO_ICMP)
+    let rawFd = socket(
+      v6 ? AF_INET6 : AF_INET, SOCK_RAW,
+      v6 ? IPPROTO_ICMPV6 : IPPROTO_ICMP)
+    var udpFd: Int32 = -1
+    if udp {
+      if rawFd < 0 {
+        emit([
+          "type": "note",
+          "message":
+            "UDP probes need raw sockets (blocked by the sandbox) — using ICMP",
+        ])
+        udp = false
+      } else {
+        udpFd = socket(v6 ? AF_INET6 : AF_INET, SOCK_DGRAM, 0)
+        if udpFd < 0 {
+          emit(["type": "note", "message": "UDP socket failed — using ICMP"])
+          udp = false
+        }
+      }
+    }
+    guard icmpFd >= 0 else {
+      emitError("ICMP socket failed: \(errnoString())")
+      if rawFd >= 0 { close(rawFd) }
+      return
+    }
+    track(icmpFd)
+    if rawFd >= 0 { track(rawFd) }
+    if udpFd >= 0 { track(udpFd) }
+    defer {
+      untrack(icmpFd)
+      close(icmpFd)
+      if rawFd >= 0 {
+        untrack(rawFd)
+        close(rawFd)
+      }
+      if udpFd >= 0 {
+        untrack(udpFd)
+        close(udpFd)
+      }
+    }
+
+    emit([
+      "type": "start",
+      "tool": "route",
+      "target": host,
+      "resolved": resolvedIp,
+      "detail": args["detail"] as? String ?? "",
+    ])
+
+    var sendTimes = [Int: Date]()
+    var answered = Set<Int>()
+    var reached = false
+    var sendFailed = false
+    var hopsDone = 0
+    let recvFds = udp ? [rawFd] : [icmpFd, rawFd].filter { $0 >= 0 }
+
+    for hop in 1...maxHops {
+      if cancelled || reached { break }
+      var lastSend = Date.distantPast
+      for p in 0..<pph {
+        if cancelled { break }
+        let idx = (hop - 1) * pph + p
+        if udp {
+          setSockOptInt(
+            udpFd, v6 ? IPPROTO_IPV6 : IPPROTO_IP,
+            v6 ? ToolS.v6Hops : ToolS.ipTtl, Int32(hop))
+          var d = dst
+          setPort(&d, UInt16(udpBasePort + idx))
+          if sendTo(
+            udpFd, [UInt8](repeating: 0x61, count: 24), d, dstLen) < 0
+            && !sendFailed
+          {
+            sendFailed = true
+            emit([
+              "type": "note",
+              "message": "UDP probe send failed: \(errnoString())",
+            ])
+          }
+        } else {
+          setSockOptInt(
+            icmpFd, v6 ? IPPROTO_IPV6 : IPPROTO_IP,
+            v6 ? ToolS.v6Hops : ToolS.ipTtl, Int32(hop))
+          if sendTo(
+            icmpFd, buildEcho(seq: idx, v6: v6, payload: 24), dst, dstLen)
+            < 0 && !sendFailed
+          {
+            sendFailed = true
+            emit([
+              "type": "note",
+              "message": "ICMP probe send failed: \(errnoString())",
+            ])
+          }
+        }
+        sendTimes[idx] = Date()
+        lastSend = Date()
+        if minDelay > 0 && p + 1 < pph {
+          usleep(UInt32(minDelay * 1000))
+        }
+      }
+
+      // Collect replies until every probe of this hop is answered or
+      // maxDelay after the last send; late answers for earlier hops
+      // re-emit that hop via handleMatch.
+      let deadline = lastSend.addingTimeInterval(
+        TimeInterval(maxDelay) / 1000)
+      while !cancelled {
+        let remain = Int(deadline.timeIntervalSinceNow * 1000)
+        if remain <= 0 { break }
+        guard let ready = pollReadable(recvFds, timeoutMs: remain),
+          !ready.isEmpty
+        else { break }
+        for fd in ready {
+          guard let msg = recvNow(fd) else { continue }
+          guard
+            let m = parseIcmp(
+              msg.bytes, off: icmpOffset(msg.bytes), v6: v6,
+              udpBasePort: udp ? udpBasePort : nil)
+          else { continue }
+          handleMatch(
+            m, src: msg.src, dst: dst, pph: pph,
+            sendTimes: sendTimes, answered: &answered,
+            reached: &reached, currentHop: hop)
+        }
+      }
+
+      emitHop(hop)
+      hopsDone = hop
+      resolveHopNames(hop)
+    }
+
+    emit([
+      "type": "done",
+      "reason": cancelled ? "stopped" : "finished",
+      "hops": hopsDone,
+      "reached": reached,
+    ])
+  }
+
+  /// Match a parsed ICMP message to a pending probe and record the
+  /// (ip, rtt) hit into hopResults. Reached = the answer came from the
+  /// target itself (echo reply or unreachable from the destination).
+  private func handleMatch(
+    _ m: (idx: Int, isReply: Bool), src: sockaddr_storage,
+    dst: sockaddr_storage, pph: Int, sendTimes: [Int: Date],
+    answered: inout Set<Int>, reached: inout Bool, currentHop: Int
+  ) {
+    let idx = m.idx
+    guard idx >= 0, !answered.contains(idx), let t = sendTimes[idx]
+    else { return }
+    answered.insert(idx)
+    let rtt = Date().timeIntervalSince(t) * 1000
+    let ip = ipString(src) ?? ""
+    let hop = idx / pph + 1
+    let p = idx % pph
+    var arr = hopResults[hop] ?? [[String: Any]?](repeating: nil, count: pph)
+    arr[p] = ["ip": ip, "rttMs": rtt]
+    hopResults[hop] = arr
+    if hop != currentHop {
+      emitHop(hop)
+      resolveHopNames(hop)
+    }
+    if sameAddr(src, dst) { reached = true }
+  }
+
+  private func emitHop(_ hop: Int) {
+    let probes = (hopResults[hop] ?? []).map { p -> [String: Any] in
+      guard let p else { return ["ip": NSNull(), "rttMs": NSNull()] }
+      return p
+    }
+    emit(["type": "hop", "hop": hop, "probes": probes])
+  }
+
+  /// Reverse-DNS each hop IP on a background queue; a hit lands as a
+  /// hopName event the UI merges into the hop row.
+  private func resolveHopNames(_ hop: Int) {
+    guard let probes = hopResults[hop] else { return }
+    for pr in probes {
+      guard let ip = pr?["ip"] as? String, nameCache[ip] == nil
+      else { continue }
+      nameCache[ip] = ""
+      DispatchQueue.global().async { [weak self] in
+        guard let self, !self.cancelled,
+          let (ss, _) = self.sockaddrFromIp(ip),
+          let name = self.reverseName(ss)
+        else { return }
+        self.emit([
+          "type": "hopName", "hop": hop, "ip": ip, "hostname": name,
+        ])
+      }
+    }
   }
 }

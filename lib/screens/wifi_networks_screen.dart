@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import '../services/theme_manager.dart' as theme_manager;
 import '../services/wifi_networks_service.dart';
 import '../widgets/app_navigation.dart';
+import '../widgets/signal_quality_meter.dart';
 import '../widgets/tdesign.dart';
 import 'wifi_network_detail_screen.dart';
 
@@ -224,7 +225,7 @@ class _WifiNetworksScreenState extends State<WifiNetworksScreen> {
                     _barsIcon(n.bars),
                     size: 20,
                     color: n.bars > 0
-                        ? themeColor
+                        ? signalQualityColor(n.rssi, n.noise)
                         : (isDark
                               ? Colors.grey.shade600
                               : Colors.grey.shade400),
@@ -279,23 +280,6 @@ class _WifiNetworksScreenState extends State<WifiNetworksScreen> {
                         ),
                     ],
                   ),
-                ),
-                const SizedBox(width: 12),
-                Column(
-                  crossAxisAlignment: CrossAxisAlignment.end,
-                  children: [
-                    TDText(
-                      n.rssi != null ? '${n.rssi} dBm' : '—',
-                      font: TDTheme.of(context).fontBodyMedium,
-                      textColor: titleColor,
-                      fontWeight: FontWeight.w600,
-                    ),
-                    TDText(
-                      n.rssiQuality,
-                      font: TDTheme.of(context).fontBodySmall,
-                      textColor: subColor,
-                    ),
-                  ],
                 ),
               ],
             ),
