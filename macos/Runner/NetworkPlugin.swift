@@ -33,6 +33,13 @@ class NetworkPlugin: NSObject, FlutterPlugin {
       result(nil)
     case "getConnectionInfo":
       result(getConnectionInfo())
+    case "getWifiNetworks":
+      // Location prompting must happen on the main thread; the scan
+      // itself blocks ~1-2s, so run it on a worker queue.
+      requestLocationIfNeeded(CWWiFiClient.shared().interface())
+      DispatchQueue.global(qos: .userInitiated).async {
+        result(self.getWifiNetworks())
+      }
     default:
       result(FlutterMethodNotImplemented)
     }
@@ -251,6 +258,308 @@ class NetworkPlugin: NSObject, FlutterPlugin {
   /// (plugin calls arrive there) and kept alive for the app lifetime.
   private lazy var locationManager = CLLocationManager()
 
+  /// CoreWLAN redacts ssid/bssid until the app holds Location Services —
+  /// ask once; the periodic refresh picks the fields up after approval.
+  private func requestLocationIfNeeded(_ w: CWInterface?) {
+    guard let w, w.ssid() == nil,
+      locationManager.authorizationStatus == .notDetermined
+    else { return }
+    locationManager.requestWhenInUseAuthorization()
+  }
+
+  // MARK: - getWifiNetworks
+
+  /// Nearby BSSes from a real scan — public CWNetwork fields only.
+  /// (The private scanRecord enrichment — real AKM/cipher suites, PHY
+  /// caps, MLO flags — is a planned later pass; see "Private APIs".)
+  /// -> {"interfaceName": String?,
+  ///     "networks": [{ssid?,bssid?,rssi,noise,channel?,band?,width?,
+  ///                   security,ibss,isCurrent}]}
+  private func getWifiNetworks() -> [String: Any] {
+    guard let w = CWWiFiClient.shared().interface(),
+      w.serviceActive()
+    else { return ["interfaceName": NSNull(), "networks": []] }
+    let myBssid = w.bssid()
+    var nets: [[String: Any]] = []
+    for n in (try? w.scanForNetworks(withSSID: nil)) ?? [] {
+      var m: [String: Any] = [
+        "ssid": n.ssid ?? NSNull(),
+        "bssid": n.bssid ?? NSNull(),
+        "rssi": n.rssiValue,
+        "noise": n.noiseMeasurement,
+        "ibss": n.ibss,
+        "security": networkSecurityLabel(n),
+        "isCurrent": myBssid != nil && n.bssid == myBssid,
+      ]
+      if let ch = n.wlanChannel {
+        m["channel"] = ch.channelNumber
+        m["band"] = channelBandString(ch.channelBand)
+        if #available(macOS 10.15, *) {
+          m["width"] = channelWidthString(ch.channelWidth)
+        }
+      }
+      enrichFromPrivate(&m, n)
+      nets.append(m)
+    }
+    return ["interfaceName": w.interfaceName ?? NSNull(), "networks": nets]
+  }
+
+  /// Private enrichment — `CWFScanResult` (via `coreWiFiScanResult`)
+  /// and `CWNetwork.scanRecord`. Every field is optional: the public
+  /// values above are always present, and every access here is guarded
+  /// with responds(to:)/nil checks so a vanished selector degrades to
+  /// "field absent" rather than a crash. See "Private APIs" in AGENTS.md.
+  private func enrichFromPrivate(_ m: inout [String: Any], _ n: CWNetwork) {
+    let csr: NSObject? =
+      n.responds(to: NSSelectorFromString("coreWiFiScanResult"))
+      ? n.value(forKey: "coreWiFiScanResult") as? NSObject
+      : nil
+    func g(_ key: String) -> Any? {
+      guard let csr, csr.responds(to: NSSelectorFromString(key)) else {
+        return nil
+      }
+      return csr.value(forKey: key)
+    }
+    func flag(_ key: String) -> Bool {
+      (g(key) as? NSNumber)?.boolValue ?? false
+    }
+
+    // -- CWFScanResult scalars ------------------------------------------
+    if let v = g("signalStrength") as? NSNumber {
+      m["signalStrength"] = v.doubleValue
+    }
+    if let v = g("channel") as? CustomStringConvertible {
+      m["channelSpec"] = v.description  // e.g. "5g36/80"
+    }
+    if let v = g("supportedPHYModes") as? NSNumber {
+      let mask = v.intValue
+      m["phySupported"] = phyMaskString(mask)
+      if let f = g("fastestSupportedPHYMode") as? NSNumber,
+        let name = phyName(f.intValue)
+      {
+        m["phyFastest"] = name
+      }
+    }
+    if let v = g("beaconInterval") as? NSNumber {
+      m["beaconInterval"] = v
+    }
+    if let v = g("age") as? NSNumber { m["ageMs"] = v }
+    if let v = g("APMode") as? NSNumber { m["apMode"] = v }
+    if let v = g("accessNetworkType") as? NSNumber {
+      m["accessNetworkType"] = v
+    }
+    if let v = g("rsnPriority") as? NSNumber { m["rsnPriority"] = v }
+    if flag("wasConnectedDuringSleep") { m["wasConnectedDuringSleep"] = true }
+    if flag("isFILSDiscoveryFrame") { m["filsDiscovery"] = true }
+    if flag("isUnconfiguredAirPortBaseStation") {
+      m["unconfiguredAP"] = true
+    }
+
+    // PMF: csr flags + the BIP management cipher — more reliable than
+    // the RSN caps bits in the dict (often absent there).
+    let bipType = (g("RSNBroadcastCipher") as? NSNumber)?.intValue
+    if flag("isMFPRequired") {
+      m["pmf"] =
+        "required" + (bipType.map { " (\(cipherName($0)))" } ?? "")
+    } else if flag("isMFPCapable") {
+      m["pmf"] =
+        "capable" + (bipType.map { " (\(cipherName($0)))" } ?? "")
+    }
+
+    // Notable booleans → a compact tag list the card can badge.
+    var tags: [String] = []
+    let tagMap: [(String, String)] = [
+      ("isPasspoint", "Passpoint"),
+      ("isHotspot", "Hotspot 2.0"),
+      ("isPersonalHotspot", "Personal hotspot"),
+      ("isWiFi6E", "6E"),
+      ("isMetered", "Metered"),
+      ("isNonTransmittedBSSID", "Non-transmitted BSSID"),
+      ("isAssociationDisallowed", "Association disallowed"),
+      ("isAppleSWAP", "Apple SWAP"),
+      ("isUnauthenticatedEmergencyServiceAccessible", "Emergency services"),
+      ("supportsWPS", "WPS"),
+      ("supportsAirPlay2", "AirPlay 2"),
+      ("supportsAirPrint", "AirPrint"),
+      ("supportsHomeKit", "HomeKit"),
+      ("supportsCarPlay", "CarPlay"),
+      ("providesInternetAccess", "Internet access"),
+      ("hasTKIPCipher", "TKIP"),
+    ]
+    for (key, label) in tagMap where flag(key) {
+      tags.append(label)
+    }
+
+    // Rarely-populated identity/venue fields — emit when present.
+    for (key, out) in [
+      ("manufacturerName", "manufacturerName"),
+      ("modelName", "modelName"),
+      ("displayName", "displayName"),
+      ("deviceID", "deviceID"),
+      ("HESSID", "hessid"),
+      ("primaryMAC", "primaryMAC"),
+      ("countryCode", "countryCode"),
+      ("accessoryFriendlyName", "friendlyName"),
+    ] {
+      if let v = g(key) { m[out] = "\(v)" }
+    }
+    for (key, out) in [
+      ("operatorFriendlyNameList", "operatorFriendlyNames"),
+      ("venueURLList", "venueURLs"),
+      ("domainNameList", "domainNames"),
+      ("roamingConsortiumList", "roamingConsortiums"),
+      ("NAIRealmNameList", "naiRealms"),
+    ] {
+      if let v = g(key) as? [Any], !v.isEmpty {
+        m[out] = v.map { "\($0)" }
+      }
+    }
+    for (key, out) in [
+      ("venueGroup", "venueGroup"), ("venueType", "venueType"),
+    ] {
+      if let v = g(key) as? NSNumber, v.intValue != 0 {
+        m[out] = v
+      }
+    }
+
+    // -- scanRecord dict -------------------------------------------------
+    guard let rec = scanRecord(n) else {
+      if !tags.isEmpty { m["tags"] = tags }
+      return
+    }
+    if let detail = describeSecurity(rec) {
+      // Prefer the csr PMF flags over the dict caps bits (often absent).
+      if let pmf = m["pmf"] as? String, !detail.contains("PMF") {
+        m["securityDetail"] = "\(detail), PMF \(pmf)"
+      } else {
+        m["securityDetail"] = detail
+      }
+    }
+    if let v = rec["RATES"] as? [NSNumber] { m["rates"] = v }
+    if let v = rec["CHANNEL_FLAGS"] as? NSNumber {
+      m["channelFlags"] = v
+    }
+    if let v = rec["CAPABILITIES"] as? NSNumber {
+      m["capabilities"] = v
+    }
+    if rec["SCAN_RESULT_FROM_PROBE_RSP"] as? NSNumber != nil {
+      m["fromProbeRsp"] =
+        (rec["SCAN_RESULT_FROM_PROBE_RSP"] as? NSNumber)?.boolValue ?? false
+    }
+    if let v = rec["SCAN_RESULT_OWE_MULTI_SSID"] as? NSNumber,
+      v.boolValue
+    {
+      m["oweMultiSsid"] = true
+    }
+    if let ht = rec["HT_IE"] as? [String: Any],
+      let off = ht["HT_SECONDARY_CHAN_OFFSET"] as? NSNumber
+    {
+      m["secondaryChanOffset"] = off
+    }
+    if let vht = rec["VHT_IE"] as? [String: Any] {
+      if let v = vht["VHT_CENTER_CHAN_SEGMENT0"] as? NSNumber {
+        m["vhtCenterChan"] = v
+      }
+    }
+    if let vht = rec["VHT_CAPS"] as? [String: Any] {
+      if let caps = vht["VHT_CAPS"] as? NSNumber {
+        // Supported channel width set (bits 0-1).
+        switch caps.intValue & 3 {
+        case 1: m["vhtMaxWidth"] = "160 MHz"
+        case 2: m["vhtMaxWidth"] = "160/80+80 MHz"
+        default: break
+        }
+      }
+      if let mcs = vht["VHT_SUPPORTED_MCS_SET"] as? Data, mcs.count >= 2 {
+        // RX MCS map: 2 bits per spatial stream, 3 = unsupported.
+        let rx = Int(mcs[0]) | Int(mcs[1]) << 8
+        let streams = (0..<8).filter { (rx >> (2 * $0)) & 3 != 3 }.count
+        if streams > 0 { m["maxStreams"] = streams }
+      }
+    } else if let ht = rec["HT_CAPS_IE"] as? [String: Any],
+      let mcs = ht["MCS_SET"] as? Data, mcs.count >= 4
+    {
+      // HT MCS mask: bytes 0-3 are the per-stream bitmaps.
+      let streams = (0..<4).filter { mcs[$0] != 0 }.count
+      if streams > 0 { m["maxStreams"] = streams }
+    }
+    // Wi-Fi 7 multi-link operation flags.
+    if (rec["MLO_CONNECTION"] as? NSNumber)?.boolValue == true {
+      tags.append("MLO")
+      m["mlo"] = true
+    }
+    if (rec["EMLSR_CONNECTION"] as? NSNumber)?.boolValue == true {
+      tags.append("EMLSR")
+    }
+    if (rec["MRSNO_CONNECTION"] as? NSNumber)?.boolValue == true {
+      tags.append("MRSNO")
+    }
+    if !tags.isEmpty { m["tags"] = tags }
+  }
+
+  /// PHY-mode bitmask — apple80211_phymode (apple80211_var.h, APSL):
+  /// 2 << (n-1) per generation. bit 9 presumably 802.11be (header
+  /// predates Wi-Fi 7).
+  private func phyName(_ bit: Int) -> String? {
+    switch bit {
+    case 1: return "802.11a"
+    case 2: return "802.11b"
+    case 3: return "802.11g"
+    case 4: return "802.11n"
+    case 5: return "Turbo A"
+    case 6: return "Turbo G"
+    case 7: return "802.11ac"
+    case 8: return "802.11ax"
+    case 9: return "802.11be"
+    default: return nil
+    }
+  }
+
+  private func phyMaskString(_ mask: Int) -> String {
+    var out: [String] = []
+    for bit in 0..<32 where mask & (1 << bit) != 0 {
+      out.append(phyName(bit)?.replacingOccurrences(of: "802.11", with: "")
+        ?? "mode-\(bit)")
+    }
+    return out.joined(separator: "/")
+  }
+
+  /// Coarse security via the public supportsSecurity(_:) probes — a
+  /// transition AP answers true for both generations, so "WPA2/WPA3"
+  /// falls out naturally. (Exact AKM names need scanRecord — later.)
+  private func networkSecurityLabel(_ n: CWNetwork) -> String {
+    if n.supportsSecurity(.none) { return "Open" }
+    if n.supportsSecurity(.WEP) { return "WEP" }
+    if n.supportsSecurity(.OWE) { return "OWE" }
+    if n.supportsSecurity(.oweTransition) { return "OWE Transition" }
+    if n.supportsSecurity(.dynamicWEP) { return "Dynamic WEP" }
+    var parts: [String] = []
+    var pgens: [String] = []
+    if n.supportsSecurity(.wpaPersonal) || n.supportsSecurity(.wpaPersonalMixed) {
+      pgens.append("WPA")
+    }
+    if n.supportsSecurity(.wpa2Personal) || n.supportsSecurity(.personal) {
+      pgens.append("WPA2")
+    }
+    if n.supportsSecurity(.wpa3Personal) { pgens.append("WPA3") }
+    if n.supportsSecurity(.wpa3Transition) { pgens = ["WPA2", "WPA3"] }
+    if !pgens.isEmpty {
+      parts.append(pgens.joined(separator: "/") + " Personal")
+    }
+    var egens: [String] = []
+    if n.supportsSecurity(.wpaEnterprise)
+      || n.supportsSecurity(.wpaEnterpriseMixed)
+    { egens.append("WPA") }
+    if n.supportsSecurity(.wpa2Enterprise)
+      || n.supportsSecurity(.enterprise)
+    { egens.append("WPA2") }
+    if n.supportsSecurity(.wpa3Enterprise) { egens.append("WPA3") }
+    if !egens.isEmpty {
+      parts.append(egens.joined(separator: "/") + " Enterprise")
+    }
+    return parts.isEmpty ? "Unknown" : parts.joined(separator: " + ")
+  }
+
   /// CoreWLAN facts for `ifname` — nil when the interface is not Wi-Fi.
   /// On macOS 14+ ssid/bssid come back nil until the app holds a
   /// Location Services grant; ask once and let the app's periodic
@@ -261,11 +570,7 @@ class NetworkPlugin: NSObject, FlutterPlugin {
       w.serviceActive()
     else { return nil }
     var m: [String: Any] = [:]
-    if w.ssid() == nil,
-      locationManager.authorizationStatus == .notDetermined
-    {
-      locationManager.requestWhenInUseAuthorization()
-    }
+    requestLocationIfNeeded(w)
     m["interfaceName"] = w.interfaceName
     if let ssid = w.ssid() { m["ssid"] = ssid }
     m["ssidAvailable"] = w.ssid() != nil

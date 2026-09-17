@@ -77,12 +77,63 @@ const _netInfo = {
   'defaultInterface': 'en0',
 };
 
+/// Canned getWifiNetworks payload — the shape NetworkPlugin returns.
+const _wifiNets = {
+  'interfaceName': 'en0',
+  'networks': [
+    {
+      'ssid': 'CoffeeShop-5G',
+      'bssid': 'aa:bb:cc:00:11:22',
+      'rssi': -42,
+      'noise': -90,
+      'channel': 36,
+      'band': '5 GHz',
+      'width': '80 MHz',
+      'security': 'WPA2 Personal',
+      'ibss': false,
+      'isCurrent': true,
+      'securityDetail': 'WPA2-PSK (CCMP-128)',
+      'phyFastest': '802.11ax',
+      'phySupported': 'n/ac/ax',
+      'signalStrength': 0.97,
+      'channelSpec': '5g36/80',
+      'maxStreams': 2,
+      'tags': ['WPS'],
+    },
+    {
+      'ssid': 'Neighbor-24',
+      'bssid': '11:22:33:44:55:66',
+      'rssi': -78,
+      'noise': -88,
+      'channel': 6,
+      'band': '2.4 GHz',
+      'width': '20 MHz',
+      'security': 'WPA2/WPA3 Personal',
+      'ibss': false,
+      'isCurrent': false,
+    },
+    {
+      'ssid': null,
+      'bssid': '22:33:44:55:66:77',
+      'rssi': -91,
+      'noise': -85,
+      'channel': 1,
+      'band': '2.4 GHz',
+      'width': '20 MHz',
+      'security': 'WPA2 Personal',
+      'ibss': false,
+      'isCurrent': false,
+    },
+  ],
+};
+
 void _mockChannel() {
   TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
       .setMockMethodCallHandler(_channel, (call) async {
         return switch (call.method) {
           'getConnectionInfo' => _connInfo,
           'getNetworkInfo' => _netInfo,
+          'getWifiNetworks' => _wifiNets,
           'getArpTable' || 'getNdpTable' => <Map>[],
           _ => null,
         };
@@ -154,7 +205,6 @@ void main() {
     await tester.pump(const Duration(milliseconds: 300));
 
     expect(find.text('Connection'), findsWidgets);
-    expect(find.text('Wi-Fi'), findsOneWidget);
     expect(find.text('TestNet'), findsOneWidget);
     expect(find.text('WPA2-PSK (CCMP-128)'), findsOneWidget);
     // Rows below the painted viewport: find.text's default skipOffstage
@@ -165,10 +215,46 @@ void main() {
       matching: find.text(text, skipOffstage: false),
       skipOffstage: false,
     );
+    // 'Wi-Fi' matches both the nav label and the Type row — scope it.
+    expect(inConnScreen('Wi-Fi'), findsOneWidget);
     expect(inConnScreen('192.168.1.42'), findsOneWidget);
     expect(inConnScreen('DNS & Proxy'), findsOneWidget);
     expect(inConnScreen('Traffic (since boot)'), findsOneWidget);
     expect(inConnScreen('10.0 MB (10.0K packets)'), findsOneWidget);
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(const Duration(seconds: 60));
+  });
+
+  testWidgets('Wi-Fi tab lists nearby networks', (tester) async {
+    tester.view.physicalSize = const Size(800, 1600);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+
+    await tester.pumpWidget(const NetNatScanApp());
+    await tester.pump();
+
+    await tester.tap(
+      find.descendant(
+        of: find.byType(BottomNavigationBar),
+        matching: find.text('Wi-Fi'),
+      ),
+    );
+    await tester.pump();
+    // Let the service's channel round-trip + OUI load land.
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.pump(const Duration(milliseconds: 300));
+
+    // Connected network first (sorted), then strongest RSSI.
+    expect(find.text('CoffeeShop-5G'), findsOneWidget);
+    expect(find.text('Connected'), findsOneWidget);
+    expect(find.text('-42 dBm'), findsOneWidget);
+    // Private enrichment lands: precise security + PHY + tags.
+    expect(find.textContaining('WPA2-PSK (CCMP-128)'), findsOneWidget);
+    expect(find.textContaining('802.11ax'), findsOneWidget);
+    expect(find.text('Neighbor-24'), findsOneWidget);
+    expect(find.text('Hidden network'), findsOneWidget);
+    expect(find.textContaining('3 networks nearby'), findsOneWidget);
 
     await tester.pumpWidget(const SizedBox.shrink());
     await tester.pump(const Duration(seconds: 60));

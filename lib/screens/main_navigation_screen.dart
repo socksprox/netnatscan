@@ -4,6 +4,7 @@ import '../services/theme_manager.dart' as theme_manager;
 import '../widgets/app_navigation.dart';
 import 'connection_info_screen.dart';
 import 'scan_screen.dart';
+import 'wifi_networks_screen.dart';
 
 /// App shell: IndexedStack of tabs behind a responsive AppNavigation —
 /// sidebar at >=1024px, bottom bar below. Tabs keep their own Scaffold
@@ -25,13 +26,22 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
       label: 'Scan',
     ),
     NavItemSpec(
+      icon: Icons.wifi_find_outlined,
+      activeIcon: Icons.wifi_find,
+      label: 'Wi-Fi',
+    ),
+    NavItemSpec(
       icon: Icons.info_outlined,
       activeIcon: Icons.info,
       label: 'Connection',
     ),
   ];
 
-  static const _tabs = [ScanScreen(), ConnectionInfoScreen()];
+  static const _tabs = [
+    ScanScreen(),
+    WifiNetworksScreen(),
+    ConnectionInfoScreen(),
+  ];
 
   void _cycleTheme() {
     final tm = theme_manager.ThemeManager();
@@ -59,8 +69,18 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
     return Scaffold(
       backgroundColor: isDark ? Colors.grey.shade900 : Colors.grey.shade50,
       body: desktop
-          ? Row(children: [nav, Expanded(child: stack)])
-          : Column(children: [Expanded(child: stack), nav]),
+          ? Row(
+              children: [
+                nav,
+                Expanded(child: stack),
+              ],
+            )
+          : Column(
+              children: [
+                Expanded(child: stack),
+                nav,
+              ],
+            ),
     );
   }
 }
