@@ -162,7 +162,7 @@ class NetworkScanner extends ChangeNotifier {
     } catch (e) {
       error = 'Could not read network interfaces: $e';
     }
-    notifyListeners();
+    _notify();
   }
 
   List<String> _subnetHosts(InterfaceInfo iface) {
@@ -188,7 +188,7 @@ class NetworkScanner extends ChangeNotifier {
     if (iface == null) {
       error = 'No active network interface found';
       progress = ScanProgress(ScanPhase.failed, 0, 0, '');
-      notifyListeners();
+      _notify();
       return;
     }
 
@@ -205,7 +205,7 @@ class NetworkScanner extends ChangeNotifier {
       hosts.length,
       'Probing ${iface.cidr ?? iface.ip}',
     );
-    notifyListeners();
+    _notify();
 
     // --- Phase 1: trigger ARP for every host, then read the table. ---
     // The IPv6 twin: a datagram to the all-nodes multicast makes every
@@ -230,7 +230,7 @@ class NetworkScanner extends ChangeNotifier {
               hosts.length,
               'Probing ${iface.cidr ?? iface.ip}',
             );
-            notifyListeners();
+            _notify();
             await Future.delayed(const Duration(milliseconds: 8));
           }
         }
@@ -240,7 +240,7 @@ class NetworkScanner extends ChangeNotifier {
     } catch (e) {
       error = 'Network probe failed: $e';
       progress = ScanProgress(ScanPhase.failed, 0, 0, '');
-      notifyListeners();
+      _notify();
       socket?.close();
       return;
     } finally {
@@ -257,7 +257,7 @@ class NetworkScanner extends ChangeNotifier {
     } catch (e) {
       error = 'Could not read ARP table: $e';
       progress = ScanProgress(ScanPhase.failed, 0, 0, '');
-      notifyListeners();
+      _notify();
       return;
     }
 
@@ -314,7 +314,7 @@ class NetworkScanner extends ChangeNotifier {
       'netnatscan: ARP scan found ${found.length} devices on ${iface.cidr ?? iface.ip}',
     );
     await _applyNdpTable();
-    notifyListeners();
+    _notify();
 
     // --- Phase 3: enrichment (mDNS + SSDP + PTR + NBNS + latency),
     // best-effort. ---
@@ -324,7 +324,7 @@ class NetworkScanner extends ChangeNotifier {
       devices.length,
       'Resolving names',
     );
-    notifyListeners();
+    _notify();
     final mdnsFuture = _discoverMdns();
     final ssdpFuture = _discoverSsdp();
     var resolved = 0;
@@ -338,7 +338,7 @@ class NetworkScanner extends ChangeNotifier {
           devices.length,
           'Resolving names',
         );
-        notifyListeners();
+        _notify();
       }
     });
     await Future.wait([mdnsFuture, ssdpFuture]);
@@ -355,7 +355,7 @@ class NetworkScanner extends ChangeNotifier {
     devices = [...devices];
     progress = ScanProgress(ScanPhase.done, 1, 1, '');
     lastScanAt = DateTime.now();
-    notifyListeners();
+    _notify();
   }
 
   /// Bonjour service types worth browsing, mapped to the device class they
@@ -449,7 +449,7 @@ class NetworkScanner extends ChangeNotifier {
       d.seenNames.remove(best.$1);
       d.hostname ??= d.mdnsName;
     }
-    notifyListeners();
+    _notify();
   }
 
   /// Maps a browse result onto the device list: names, service types, and
@@ -597,7 +597,7 @@ class NetworkScanner extends ChangeNotifier {
       d.addIpv6(ip);
       changed = changed || d.ipv6Addresses.length != before;
     }
-    if (changed) notifyListeners();
+    if (changed) _notify();
   }
 
   /// NetBIOS node-status per device — Windows/Samba hosts answer with
@@ -722,6 +722,12 @@ class NetworkScanner extends ChangeNotifier {
     return seen != null && seen.isAfter(start);
   }
 
+  /// In-flight async work (a scan pass, the passive mDNS loop) can finish
+  /// after the screen that owns us is gone — skip notifying dead listeners.
+  void _notify() {
+    if (!_disposed) notifyListeners();
+  }
+
   @override
   void dispose() {
     _disposed = true;
@@ -777,8 +783,9 @@ class NetworkScanner extends ChangeNotifier {
       if (host.endsWith('.')) host = host.substring(0, host.length - 1);
       if (host != d.ip && host.isNotEmpty) {
         d.hostname = host.replaceAll(RegExp(r'\.local$'), '');
-        if (d.mdnsName == null) d.nameSource = DeviceNameSource.dns;
         d.lastSeenAt = DateTime.now(); // fresh PTR identity evidence
+        _addNameCandidate(d.ip, d.hostname, 40, DeviceNameSource.dns);
+        _finalizeNames();
       }
     } catch (_) {}
   }
@@ -954,7 +961,7 @@ class NetworkScanner extends ChangeNotifier {
     }
     if (d.openPorts.any((p) => p == 443 || p == 8443)) await _probeTls(d);
     await _probeHttp(d);
-    notifyListeners();
+    _notify();
   }
 
   /// A device answering TLS identifies itself in the certificate subject —

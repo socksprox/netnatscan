@@ -26,6 +26,10 @@
 	<string>$(PRODUCT_COPYRIGHT)</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>netnatscan scans your local network to list connected devices.</string>
+	<key>NSLocationUsageDescription</key>
+	<string>macOS protects the Wi-Fi name (SSID) and BSSID as location data; netnatscan uses your location only to display them on the Connection tab.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>macOS protects the Wi-Fi name (SSID) and BSSID as location data; netnatscan uses your location only to display them on the Connection tab.</string>
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_companion-link._tcp</string>

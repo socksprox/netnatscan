@@ -6,8 +6,8 @@ import '../widgets/tdesign.dart';
 import '../models/network_device.dart';
 import '../services/network_scanner.dart';
 import '../services/theme_manager.dart' as theme_manager;
+import '../widgets/app_navigation.dart';
 import '../widgets/centered_button.dart';
-import '../widgets/custom_app_bar.dart';
 import 'device_detail_screen.dart';
 
 class ScanScreen extends StatefulWidget {
@@ -26,14 +26,11 @@ class _ScanScreenState extends State<ScanScreen> {
     _scanner.refreshNetworkInfo().then((_) => _scanner.scan());
   }
 
-  void _cycleTheme() {
-    final tm = theme_manager.ThemeManager();
-    final next = switch (tm.themeMode) {
-      theme_manager.ThemeMode.system => theme_manager.ThemeMode.light,
-      theme_manager.ThemeMode.light => theme_manager.ThemeMode.dark,
-      theme_manager.ThemeMode.dark => theme_manager.ThemeMode.system,
-    };
-    tm.setThemeMode(next);
+  @override
+  void dispose() {
+    // Stops the passive mDNS loop that would otherwise run forever.
+    _scanner.dispose();
+    super.dispose();
   }
 
   @override
@@ -41,36 +38,28 @@ class _ScanScreenState extends State<ScanScreen> {
     final isDark = Theme.of(context).brightness == Brightness.dark;
     return Scaffold(
       backgroundColor: isDark ? Colors.grey.shade900 : Colors.grey.shade50,
-      appBar: CustomAppBar(
-        title: 'Network Scan',
-        automaticallyImplyLeading: false,
-        actions: [
-          Material(
-            color: Colors.transparent,
-            child: InkWell(
-              onTap: _cycleTheme,
-              borderRadius: BorderRadius.circular(8),
-              child: Padding(
-                padding: const EdgeInsets.all(8),
-                child: Icon(
-                  switch (theme_manager.ThemeManager().themeMode) {
-                    theme_manager.ThemeMode.system =>
-                      Icons.brightness_auto_outlined,
-                    theme_manager.ThemeMode.light => Icons.light_mode_outlined,
-                    theme_manager.ThemeMode.dark => Icons.dark_mode_outlined,
-                  },
-                  color: isDark ? Colors.white : Colors.black,
-                  size: 20,
+      body: SafeArea(
+        bottom: false,
+        child: Column(
+          children: [
+            // Wide windows get the theme row in the sidebar; only the
+            // narrow bottom-nav layout needs the toggle.
+            if (!AppNavigation.isDesktop(context))
+              const Align(
+                alignment: Alignment.centerRight,
+                child: Padding(
+                  padding: EdgeInsets.only(right: 8, top: 4),
+                  child: ThemeCycleButton(),
                 ),
               ),
+            Expanded(
+              child: AnimatedBuilder(
+                animation: _scanner,
+                builder: (context, _) => _buildBody(context, isDark),
+              ),
             ),
-          ),
-          const SizedBox(width: 4),
-        ],
-      ),
-      body: AnimatedBuilder(
-        animation: _scanner,
-        builder: (context, _) => _buildBody(context, isDark),
+          ],
+        ),
       ),
     );
   }

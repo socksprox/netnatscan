@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 
-import 'screens/scan_screen.dart';
+import 'screens/main_navigation_screen.dart';
 import 'services/theme_manager.dart' as theme_manager;
 
 void main() async {
@@ -56,7 +56,7 @@ class _NetNatScanAppState extends State<NetNatScanApp> {
       themeMode: brightness == Brightness.dark
           ? ThemeMode.dark
           : ThemeMode.light,
-      home: const ScanScreen(),
+      home: const MainNavigationScreen(),
     );
   }
 }

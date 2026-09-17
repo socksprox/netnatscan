@@ -2,6 +2,13 @@
 
 Flutter macOS app: LAN device scanner in the style of iOS "NetAnalyzer".
 
+**Not targeting the App Store** — private APIs, disabling the sandbox,
+and subprocesses are all fair game. **Policy: use the public API when it
+can deliver the data; private API is fine when it can't.** Guard every
+private call (`responds(to:)` / nil checks) and degrade gracefully —
+selectors can vanish across macOS versions. See "Private APIs" below for
+the verified inventory.
+
 ## Design
 
 - UI rules: `.devin/rules/ui-design.md` — TDesign-styled components copied from
@@ -65,10 +72,110 @@ Flutter macOS app: LAN device scanner in the style of iOS "NetAnalyzer".
 Native code is required — Dart cannot read the ARP table or netmasks, and
 the sandbox blocks subprocesses (`ping`, `arp`).
 
+## App shell
+
+`lib/screens/main_navigation_screen.dart` hosts an `IndexedStack` of tabs
+(currently: `ScanScreen`, `ConnectionInfoScreen`) so tab state survives
+switches. `lib/widgets/app_navigation.dart` is the responsive nav —
+Shadowfly-admin style: vertical sidebar when the window is ≥ ~1024px
+wide, `BottomNavigationBar` below that. Each tab keeps its own
+`CustomAppBar`.
+
+## Connection tab
+
+`lib/screens/connection_info_screen.dart` +
+`lib/services/connection_info_service.dart`: shows everything knowable
+about the current uplink — Wi-Fi SSID/BSSID/security/RSSI/channel/PHY,
+interfaces (addresses, MAC, MTU, link speed), DNS/search domains,
+proxies, DHCP lease, gateways v4/v6, boot time/uptime, public IP
+(api.ipify.org, skipped under `FLUTTER_TEST`), and since-boot rx/tx
+counters with live rates (2s ticker diffs successive samples).
+
+`getConnectionInfo` on the same `netnatscan/network` channel returns one
+map from `NetworkPlugin.swift`: CoreWLAN (`CWWiFiClient`) for Wi-Fi
+metadata, `getifaddrs` for addresses, `NET_RT_IFLIST2` for 64-bit
+interface counters (filter records by `RTM_IFINFO2` — the dump
+interleaves address records that decode to garbage), `SCDynamicStore`
+for DNS/proxies/DHCP (`State:/Network/Service/<uuid>/DHCP`, uuid via
+`State:/Network/Global/IPv4` → `PrimaryService`).
+
+Wi-Fi `security` is the coarse `CWSecurity` class ("WPA2 Personal");
+`securityDetail` is the precise label ("WPA2-PSK (CCMP-128)") parsed
+from the private `CWNetwork.scanRecord` accessor — its `RSN_IE`/`WPA_IE`
+dicts carry the real AKM suite list (`IE_KEY_RSN_AUTHSELS`) and cipher
+suites (`IE_KEY_RSN_UCIPHERS`/`MCIPHER`) from the beacon IE. Looked up
+via `cachedScanResults` matched on BSSID, with a 30s-rate-limited live
+scan as fallback; UI prefers `securityDetail` and falls back to
+`security`.
+
+## Private APIs
+
+Policy above applies. Inventory below is **verified by runtime probing**
+(`class_copyMethodList` + KVC on live objects) unless marked otherwise.
+
+Things no public API exposes:
+
+- **`CWNetwork.scanRecord`** (dict, KVC) — parsed beacon/probe record per
+  scanned BSS: `RSN_IE` (`IE_KEY_RSN_AUTHSELS` AKM list,
+  `IE_KEY_RSN_UCIPHERS`/`MCIPHER` ciphers, version; `IE_KEY_RSN_CAPS`
+  PMF bits when present), `WPA_IE`, `HT_CAPS_IE`, `HT_IE` (secondary
+  channel offset → real channel layout), `VHT_CAPS`/`VHT_IE`, `EXT_CAPS`
+  (`BSS_TRANS_MGMT` = 802.11v), `RATES`, `RSSI`, `NOISE`, `SNR`,
+  `BEACON_INT`, `CAPABILITIES` (privacy bit), `CHANNEL`,
+  `CHANNEL_FLAGS`, `PHY_MODE`, `AP_MODE`, `MLO_CONNECTION` /
+  `EMLSR_CONNECTION` / `MRSNO_CONNECTION` (Wi-Fi 7), `AGE`,
+  `SCAN_RESULT_FROM_PROBE_RSP`. This is the only in-process access to
+  real AKM/cipher suites — `CWSecurity` flattens them.
+- **`CWNetwork.coreWiFiScanResult`** — object whose `description`
+  decodes e.g. `security=wpa2-personal, rsn=[mcast=aes_ccm, bip=none,
+  ucast={aes_ccm}, auths={psk}, mfp=no, caps=0x0], channel=2g11/20,
+  phy=n, rssi=-83, wasConnectedDuringSleep=0, bi=100, age=…` — includes
+  PMF (`mfp`) + BIP management cipher that `RSN_IE` alone doesn't give.
+  Structured accessors on its class not yet enumerated.
+- **`CWInterface.IO80211ControllerInfo`** — chipset identity:
+  ManufacturerID (0x14E4 Broadcom), ProductID, module string, subsystem
+  vendor. No public equivalent.
+- **`CWInterface.powerDebugInfo`** — huge radio-power counters dict:
+  assoc sleep duration, per-band scan counts/durations, ARP-offload
+  activity, AWDL awake duration, …
+- **`CWInterface.eapolClient`** — `CWEAPOLClient` object (supplicant
+  state for enterprise networks; unexplored).
+- **`CWInterface.capabilities` / `interfaceCapabilities`** — capability
+  list / bitmask; `securityType`/`securityMode` — internal enums
+  (128/3 = WPA2 personal on this machine).
+- **ANQP** — `queryANQPElements:network:maxAge:…` /
+  `queryANQPCacheWithElements:` — 802.11u/Passpoint venue+operator
+  metadata from hotspot APs.
+- **Trimmed scan properties** — `cachedTrimmedScanResultsWithProperties:`,
+  `queryScanCacheWithChannels:…trimmedScanResultProperties:` — request
+  specific fields per network; likely the way to populate
+  `ieData`/`informationElementData` (raw IE blob — nil in normal cached
+  results).
+- **`CWNetwork.wasConnectedDuringSleep`**, `accessoryFriendlyName`,
+  `hasInterworkingIE` — extra per-network flags.
+- **`CWInterface` control surface** (not needed, but exists):
+  `startHostAPModeWithSSID:securityType:channel:password:` (host AP
+  mode!), `associateToEnterpriseNetwork:…` variants, `enableIBSS…`,
+  `clearScanCache`, `initWithInterfaceName:xpcClient:legacy:` (raw
+  `CWXPCClient` → airportd).
+- **`Apple80211` private framework** (dlopen; *not yet verified in-app*):
+  `Apple80211Open`/`BindToInterface`/`Get`/`Set`/`Scan` — per-chain
+  RSSI/noise (`RSSI_CTL_LIST`), MCS index, tx rate/PHY rate, supported
+  channel list, reg domain. Wraps the airportd XPC — likely needs the
+  sandbox off.
+
+Public-but-unused so far: `startMonitoringEventWithName:` (CWEventType
+→ roam/link-quality/power/disassociation event stream).
+
 ## Entitlements
 
-`network.client` + `network.server` (both DebugProfile and Release).
+`network.client` + `network.server` + `personal-information.location`
+(both DebugProfile and Release — location is needed because CoreWLAN
+redacts SSID/BSSID without it; `NSLocationWhenInUseUsageDescription` +
+legacy `NSLocationUsageDescription` in Info.plist).
 `NSLocalNetworkUsageDescription` + `NSBonjourServices` in Info.plist.
+The sandbox itself can be dropped if a private API needs it — no App
+Store requirement (see top of file).
 New `.swift` files must be added to `macos/Runner.xcodeproj/project.pbxproj`
 manually (4 places: PBXBuildFile, PBXFileReference, Runner group, Sources phase).
 
@@ -88,4 +195,12 @@ open build/macos/Build/Products/Debug/netnatscan.app
   use `NET_RT_DUMP` for the full table, `RTF_LLINFO` for ARP.
 - `sockaddr_dl.sdl_data` is only 12 bytes — check `sdl_nlen + sdl_alen <= 12`
   before reading the MAC (long interface names like `bridge0` overflow it).
+- `NetworkScanner` is a `ChangeNotifier` owned by `ScanScreen` — dispose
+  it on unmount or the passive mDNS loop leaks; in-flight async work
+  notifies through `_notify()` so listeners aren't touched after dispose.
+- Widget tests: `find.text` (default `skipOffstage`) only traverses
+  onstage children — `IndexedStack` keeps hidden tabs alive but skipped,
+  and `ListView` children outside the paint extent are skipped too.
+  Scope with `find.descendant(..., skipOffstage: false)` or enlarge
+  `tester.view.physicalSize` so everything builds.
 - Device type classification lives in `lib/models/network_device.dart`.

@@ -1,6 +1,9 @@
 import Cocoa
 import FlutterMacOS
 import Darwin
+import CoreLocation
+import CoreWLAN
+import SystemConfiguration
 
 /// Exposes link-local network facts that dart:io cannot reach on macOS:
 /// interface list with IPv4/netmask/MAC, the default route, and the ARP
@@ -28,6 +31,8 @@ class NetworkPlugin: NSObject, FlutterPlugin {
     case "triggerNdp":
       triggerNdp(interface: call.arguments as? String)
       result(nil)
+    case "getConnectionInfo":
+      result(getConnectionInfo())
     default:
       result(FlutterMethodNotImplemented)
     }
@@ -104,6 +109,525 @@ class NetworkPlugin: NSObject, FlutterPlugin {
       "defaultGateway": route.gateway ?? NSNull(),
       "defaultInterface": route.interface ?? NSNull(),
     ]
+  }
+
+  // MARK: - getConnectionInfo
+
+  /// Everything about the *current* uplink in one call, all in-process:
+  /// -> {
+  ///   "hostname": String?,
+  ///   "primaryInterface": String?,
+  ///   "networkType": "wifi"|"ethernet"|"other"|"offline",
+  ///   "defaultGateway": String?, "ipv6Gateway": String?,
+  ///   "wifi": {ssid?,bssid?,security,securityDetail?,rssi?,noise?,transmitRate,
+  ///            channel?,channelBand?,channelWidth?,phyMode,
+  ///            countryCode?,mac?,interfaceName}?,
+  ///   "interfaces": {name: {index,flags,mtu,baudrate,type?,mac?,
+  ///            rxBytes,txBytes,rxPackets,txPackets,rxErrors,txErrors,
+  ///            rxQDrops,collisions}},
+  ///   "dnsServers": [String], "searchDomains": [String],
+  ///   "proxies": {HTTPEnable?,HTTPProxy?,HTTPPort?,...},
+  ///   "dhcp": {LeaseStartTime? (epoch), ServerIdentifier?, ...},
+  ///   "bootTime": Double?, "uptimeSeconds": Double?
+  /// }
+  private func getConnectionInfo() -> [String: Any] {
+    var payload: [String: Any] = [:]
+
+    var host = [CChar](repeating: 0, count: Int(MAXHOSTNAMELEN))
+    if gethostname(&host, host.count) == 0 {
+      payload["hostname"] = String(cString: host)
+    }
+
+    let route = defaultRoute()
+    payload["defaultGateway"] = route.gateway ?? NSNull()
+    payload["ipv6Gateway"] = defaultGatewayV6() ?? NSNull()
+
+    let stats = interfaceStats()
+    payload["interfaces"] = stats
+
+    let primary = route.interface ?? firstUpInterface(stats)
+    payload["primaryInterface"] = primary ?? NSNull()
+
+    // CWWiFiClient answers nil for non-Wi-Fi interface names, so a hit is
+    // itself the Wi-Fi detection (Wi-Fi MACs report sdl_type IFT_ETHER too).
+    let wifi = wifiInfo(for: primary)
+    if let wifi {
+      payload["wifi"] = wifi
+    }
+    payload["networkType"] = networkType(
+      primary: primary, wifi: wifi, stats: stats)
+
+    if let store = SCDynamicStoreCreate(nil, "netnatscan" as CFString, nil, nil) {
+      let dns =
+        SCDynamicStoreCopyValue(store, "State:/Network/Global/DNS" as CFString)
+        as? [String: Any]
+      payload["dnsServers"] = dns?["ServerAddresses"] as? [String] ?? []
+      payload["searchDomains"] = dns?["SearchDomains"] as? [String] ?? []
+      payload["proxies"] = proxySettings(store: store)
+      payload["dhcp"] = dhcpInfo(store: store)
+    }
+
+    let boot = bootTime()
+    payload["bootTime"] = boot ?? NSNull()
+    if let boot {
+      payload["uptimeSeconds"] = max(
+        0, Date().timeIntervalSince1970 - boot)
+    }
+    return payload
+  }
+
+  /// 64-bit interface counters via the NET_RT_IFLIST2 sysctl dump — the
+  /// same PF_ROUTE mechanism as the route/ARP walks, but each record is
+  /// an if_msghdr2 carrying an if_data64 plus a sockaddr_dl (RTA_IFP)
+  /// with the interface name, link type and MAC. All in-process.
+  private func interfaceStats() -> [String: [String: Any]] {
+    guard let dump = sysctlDump(op: NET_RT_IFLIST2, flags: 0, family: 0)
+    else { return [:] }
+    var out: [String: [String: Any]] = [:]
+    forEachIfEntry(in: dump) { ifm, addrs in
+      // The dump interleaves address records (RTM_NEWADDR/NEWMADDR2)
+      // with interface records — only RTM_IFINFO2 carries if_data64.
+      guard Int(ifm.pointee.ifm_type) == Int(RTM_IFINFO2),
+        let name = ifName(UInt32(ifm.pointee.ifm_index))
+      else { return }
+      let d = ifm.pointee.ifm_data
+      var m: [String: Any] = [
+        "index": Int(ifm.pointee.ifm_index),
+        "flags": Int(ifm.pointee.ifm_flags),
+        "mtu": Int(d.ifi_mtu),
+        "baudrate": Int(d.ifi_baudrate),
+        "rxPackets": Int(d.ifi_ipackets),
+        "rxErrors": Int(d.ifi_ierrors),
+        "txPackets": Int(d.ifi_opackets),
+        "txErrors": Int(d.ifi_oerrors),
+        "rxBytes": Int(d.ifi_ibytes),
+        "txBytes": Int(d.ifi_obytes),
+        "rxQDrops": Int(d.ifi_iqdrops),
+        "collisions": Int(d.ifi_collisions),
+      ]
+      if let sdlOffset = addrs[Int(RTA_IFP)],
+        let sdlBytes = sockaddrDLBytes(in: dump, at: sdlOffset),
+        let dl = parseSockaddrDL(sdlBytes)
+      {
+        m["type"] = dl.type
+        if dl.addr.count == 6 {
+          m["mac"] = dl.addr.map { String(format: "%02x", $0) }
+            .joined(separator: ":")
+        }
+      }
+      out[name] = m
+    }
+    return out
+  }
+
+  /// Fallback primary when there is no default route: lowest-indexed
+  /// up, non-loopback interface.
+  private func firstUpInterface(_ stats: [String: [String: Any]]) -> String? {
+    let sorted = stats.sorted {
+      ($0.value["index"] as? Int ?? 0) < ($1.value["index"] as? Int ?? 0)
+    }
+    for (name, s) in sorted {
+      let flags = s["flags"] as? Int ?? 0
+      let up = (flags & Int(IFF_UP)) != 0
+      let loop = (flags & Int(IFF_LOOPBACK)) != 0
+      if up && !loop { return name }
+    }
+    return nil
+  }
+
+  private func networkType(
+    primary: String?, wifi: [String: Any]?, stats: [String: [String: Any]]
+  ) -> String {
+    guard let primary else { return "offline" }
+    if wifi != nil { return "wifi" }
+    if let t = stats[primary]?["type"] as? Int {
+      if t == Int(IFT_ETHER) { return "ethernet" }
+      if t == Int(IFT_LOOP) { return "loopback" }
+    }
+    return "other"
+  }
+
+  /// Held lazily for the location grant — created on the main thread
+  /// (plugin calls arrive there) and kept alive for the app lifetime.
+  private lazy var locationManager = CLLocationManager()
+
+  /// CoreWLAN facts for `ifname` — nil when the interface is not Wi-Fi.
+  /// On macOS 14+ ssid/bssid come back nil until the app holds a
+  /// Location Services grant; ask once and let the app's periodic
+  /// refresh pick the fields up after the user approves.
+  private func wifiInfo(for ifname: String?) -> [String: Any]? {
+    guard let ifname,
+      let w = CWWiFiClient.shared().interface(withName: ifname),
+      w.serviceActive()
+    else { return nil }
+    var m: [String: Any] = [:]
+    if w.ssid() == nil,
+      locationManager.authorizationStatus == .notDetermined
+    {
+      locationManager.requestWhenInUseAuthorization()
+    }
+    m["interfaceName"] = w.interfaceName
+    if let ssid = w.ssid() { m["ssid"] = ssid }
+    m["ssidAvailable"] = w.ssid() != nil
+    if let bssid = w.bssid() { m["bssid"] = bssid }
+    m["security"] = securityString(w.security())
+    if let detail = securityDetail(w) {
+      m["securityDetail"] = detail
+    }
+    m["rssi"] = w.rssiValue()
+    m["noise"] = w.noiseMeasurement()
+    m["transmitRate"] = w.transmitRate()
+    if let ch = w.wlanChannel() {
+      m["channel"] = ch.channelNumber
+      m["channelBand"] = channelBandString(ch.channelBand)
+      if #available(macOS 10.15, *) {
+        m["channelWidth"] = channelWidthString(ch.channelWidth)
+      }
+    }
+    m["phyMode"] = phyModeString(w.activePHYMode())
+    if let cc = w.countryCode() { m["countryCode"] = cc }
+    if let mac = w.hardwareAddress() { m["mac"] = mac }
+    return m
+  }
+
+  /// Precise security label parsed from the associated network's scan
+  /// record — the private `CWNetwork.scanRecord` accessor returns the
+  /// already-parsed beacon IEs, including RSN_IE/WPA_IE dicts with the
+  /// AKM suite list + cipher suites that the public CWSecurity enum
+  /// flattens into "Personal"/"Enterprise".
+  private var securityDetailCache: [String: String] = [:]
+  private var lastSecurityScanAt = Date.distantPast
+
+  private func securityDetail(_ w: CWInterface) -> String? {
+    let key = w.bssid() ?? w.ssid() ?? w.interfaceName ?? "?"
+    let match: (CWNetwork) -> Bool = { net in
+      if let b = w.bssid(), let nb = net.bssid { return nb == b }
+      return net.ssid == w.ssid()
+    }
+    if let net = w.cachedScanResults()?.first(where: match),
+      let rec = scanRecord(net), let detail = describeSecurity(rec)
+    {
+      securityDetailCache[key] = detail
+      return detail
+    }
+    if let cached = securityDetailCache[key] { return cached }
+    // Scan cache missed — try a real scan, rate-limited so the 2s
+    // refresh tick doesn't hammer the radio.
+    guard Date().timeIntervalSince(lastSecurityScanAt) > 30 else {
+      return nil
+    }
+    lastSecurityScanAt = Date()
+    guard let nets = try? w.scanForNetworks(withSSID: w.ssidData()),
+      let net = nets.first(where: match),
+      let rec = scanRecord(net), let detail = describeSecurity(rec)
+    else { return nil }
+    securityDetailCache[key] = detail
+    return detail
+  }
+
+  private func scanRecord(_ net: CWNetwork) -> [String: Any]? {
+    guard net.responds(to: NSSelectorFromString("scanRecord")) else {
+      return nil
+    }
+    return net.value(forKey: "scanRecord") as? [String: Any]
+  }
+
+  /// RSN/WPA suite type numbers are the trailing octet of the 00-0F-AC
+  /// OUI suite selectors in the beacon IE.
+  private func akmName(_ t: Int) -> String {
+    switch t {
+    case 1: return "802.1X"
+    case 2: return "PSK"
+    case 3: return "FT-802.1X"
+    case 4: return "FT-PSK"
+    case 5: return "802.1X-SHA256"
+    case 6: return "PSK-SHA256"
+    case 7: return "TDLS"
+    case 8: return "SAE"
+    case 9: return "FT-SAE"
+    case 11: return "802.1X-Suite-B"
+    case 12: return "802.1X-Suite-B-192"
+    case 13: return "FT-802.1X-SHA384"
+    case 14: return "FILS-SHA256"
+    case 15: return "FILS-SHA384"
+    case 16: return "FT-FILS-SHA256"
+    case 17: return "FT-FILS-SHA384"
+    case 18: return "OWE"
+    case 24: return "SAE-EXT"
+    default: return "AKM-\(t)"
+    }
+  }
+
+  private func cipherName(_ t: Int) -> String {
+    switch t {
+    case 0: return "Group"
+    case 1: return "WEP-40"
+    case 2: return "TKIP"
+    case 4: return "CCMP-128"
+    case 5: return "WEP-104"
+    case 6: return "BIP-CMAC-128"
+    case 7: return "None"
+    case 8: return "GCMP-128"
+    case 9: return "GCMP-256"
+    case 10: return "CCMP-256"
+    case 11: return "BIP-GMAC-128"
+    case 12: return "BIP-GMAC-256"
+    case 13: return "BIP-CMAC-256"
+    default: return "Cipher-\(t)"
+    }
+  }
+
+  private func describeSecurity(_ rec: [String: Any]) -> String? {
+    func nums(_ v: Any?) -> [Int] {
+      (v as? [NSNumber])?.map { $0.intValue } ?? []
+    }
+    if let rsn = rec["RSN_IE"] as? [String: Any] {
+      let akmTypes = nums(rsn["IE_KEY_RSN_AUTHSELS"])
+      let uciphers = nums(rsn["IE_KEY_RSN_UCIPHERS"])
+      let mcipher = (rsn["IE_KEY_RSN_MCIPHER"] as? NSNumber)?.intValue
+      // WPA3 whenever an SAE-family AKM is present; PSK alongside it
+      // means transition mode. A legacy WPA_IE too → WPA mixed mode.
+      let sae = akmTypes.contains { [8, 9, 24].contains($0) }
+      let psk = akmTypes.contains { [2, 4, 6].contains($0) }
+      var gen = sae ? (psk ? "WPA2/WPA3" : "WPA3") : "WPA2"
+      if rec["WPA_IE"] != nil { gen = "WPA/" + gen }
+      var s = gen
+      if !akmTypes.isEmpty {
+        s += "-" + akmTypes.map(akmName).joined(separator: "+")
+      }
+      var extra = uciphers.map(cipherName).joined(separator: "+")
+      if let g = mcipher, !uciphers.contains(g) {
+        extra += (extra.isEmpty ? "" : ", ") + "group: \(cipherName(g))"
+      }
+      // RSN capabilities: bit 6 MFPC (PMF capable), bit 7 MFPR (required).
+      if let caps = (rsn["IE_KEY_RSN_CAPS"] as? NSNumber)?.intValue {
+        if caps & 0x80 != 0 { extra += ", PMF required" }
+        else if caps & 0x40 != 0 { extra += ", PMF capable" }
+      }
+      if !extra.isEmpty { s += " (\(extra))" }
+      return s
+    }
+    if let wpa = rec["WPA_IE"] as? [String: Any] {
+      let akms = nums(wpa["IE_KEY_WPA_AUTHSELS"]).map(akmName)
+      let uciphers = nums(wpa["IE_KEY_WPA_UCIPHERS"]).map(cipherName)
+      var s = "WPA"
+      if !akms.isEmpty { s += "-" + akms.joined(separator: "+") }
+      if !uciphers.isEmpty {
+        s += " (\(uciphers.joined(separator: "+")))"
+      }
+      return s
+    }
+    // No security IEs — the beacon capability privacy bit (0x10)
+    // distinguishes WEP from a fully open network.
+    if let caps = (rec["CAPABILITIES"] as? NSNumber)?.intValue {
+      return caps & 0x10 != 0 ? "WEP" : "Open"
+    }
+    return nil
+  }
+
+  private func securityString(_ s: CWSecurity) -> String {
+    switch s {
+    case .none: return "None"
+    case .WEP: return "WEP"
+    case .wpaPersonal, .wpaPersonalMixed: return "WPA Personal"
+    case .wpa2Personal, .personal: return "WPA2 Personal"
+    case .dynamicWEP: return "Dynamic WEP"
+    case .wpaEnterprise, .wpaEnterpriseMixed: return "WPA Enterprise"
+    case .wpa2Enterprise, .enterprise:
+      return "WPA2 Enterprise"
+    case .wpa3Personal: return "WPA3 Personal"
+    case .wpa3Enterprise: return "WPA3 Enterprise"
+    case .wpa3Transition: return "WPA2/WPA3 Transition"
+    case .OWE: return "OWE"
+    case .oweTransition: return "OWE Transition"
+    default: return "Unknown"
+    }
+  }
+
+  private func phyModeString(_ m: CWPHYMode) -> String {
+    switch m {
+    case .mode11a: return "802.11a"
+    case .mode11b: return "802.11b"
+    case .mode11g: return "802.11g"
+    case .mode11n: return "802.11n"
+    case .mode11ac: return "802.11ac"
+    case .mode11ax: return "802.11ax"
+    default: return "Unknown"
+    }
+  }
+
+  private func channelBandString(_ b: CWChannelBand) -> String {
+    switch b {
+    case .band2GHz: return "2.4 GHz"
+    case .band5GHz: return "5 GHz"
+    case .band6GHz: return "6 GHz"
+    default: return "Unknown"
+    }
+  }
+
+  @available(macOS 10.15, *)
+  private func channelWidthString(_ w: CWChannelWidth) -> String {
+    switch w {
+    case .width20MHz: return "20 MHz"
+    case .width40MHz: return "40 MHz"
+    case .width80MHz: return "80 MHz"
+    case .width160MHz: return "160 MHz"
+    default: return "Unknown"
+    }
+  }
+
+  /// IPv6 default route (fe80:: link-local gateway, %iface-scoped) —
+  /// the AF_INET6 twin of defaultRoute().
+  private func defaultGatewayV6() -> String? {
+    guard let dump = sysctlDump(op: NET_RT_DUMP, flags: 0, family: AF_INET6)
+    else { return nil }
+    var gateway: String?
+    forEachRouteEntry(in: dump) { rtm, addrs in
+      guard gateway == nil,
+        (rtm.pointee.rtm_flags & RTF_GATEWAY) != 0,
+        let dstOffset = addrs[Int(RTA_DST)],
+        let gwOffset = addrs[Int(RTA_GATEWAY)],
+        let dstBytes = sockaddrIn6Bytes(in: dump, at: dstOffset),
+        dstBytes.allSatisfy({ $0 == 0 }),
+        let gwBytes = sockaddrIn6Bytes(in: dump, at: gwOffset)
+      else { return }
+      gateway = ipv6String(gwBytes, scopeIfname: nil)
+    }
+    return gateway
+  }
+
+  /// Proxy config from the global dynamic-store key — only the scalar
+  /// switches/servers the UI can render.
+  private func proxySettings(store: SCDynamicStore) -> [String: Any] {
+    guard
+      let p = SCDynamicStoreCopyValue(
+        store, "State:/Network/Global/Proxies" as CFString) as? [String: Any]
+    else { return [:] }
+    var out: [String: Any] = [:]
+    for key in [
+      "HTTPEnable", "HTTPProxy", "HTTPPort",
+      "HTTPSEnable", "HTTPSProxy", "HTTPSPort",
+      "SOCKSEnable", "SOCKSProxy", "SOCKSPort",
+      "ProxyAutoConfigEnable", "ProxyAutoConfigURLString",
+    ] {
+      if let v = p[key], v is String || v is NSNumber { out[key] = v }
+    }
+    if let ex = p["ExceptionsList"] as? [String] {
+      out["exceptions"] = ex
+    }
+    return out
+  }
+
+  /// DHCP lease details for the primary IPv4 service. The lease lives
+  /// under State:/Network/Service/<PrimaryService>/DHCP: lease times as
+  /// dates plus raw Option_<n> blobs — decoded for the ones the UI can
+  /// name (router, server id, lease duration, subnet, DNS, domain).
+  private func dhcpInfo(store: SCDynamicStore) -> [String: Any] {
+    guard
+      let global = SCDynamicStoreCopyValue(
+        store, "State:/Network/Global/IPv4" as CFString) as? [String: Any],
+      let service = global["PrimaryService"] as? String,
+      let dhcp = SCDynamicStoreCopyValue(
+        store, "State:/Network/Service/\(service)/DHCP" as CFString)
+        as? [String: Any]
+    else { return [:] }
+
+    var out: [String: Any] = [:]
+    if let d = dhcp["LeaseStartTime"] as? Date {
+      out["LeaseStartTime"] = d.timeIntervalSince1970
+    }
+    if let d = dhcp["LeaseExpirationTime"] as? Date {
+      out["LeaseExpirationTime"] = d.timeIntervalSince1970
+    }
+    if let data = dhcp["Option_54"] as? Data, let ip = ipv4Option(data, at: 0)
+    {
+      out["ServerIdentifier"] = ip
+    }
+    if let data = dhcp["Option_51"] as? Data, data.count >= 4 {
+      out["LeaseDurationSeconds"] = Int(
+        UInt32(bigEndian: data.prefix(4).withUnsafeBytes {
+          $0.load(as: UInt32.self)
+        }))
+    }
+    if let data = dhcp["Option_3"] as? Data, let ip = ipv4Option(data, at: 0)
+    {
+      out["Router"] = ip
+    }
+    if let data = dhcp["Option_1"] as? Data, let ip = ipv4Option(data, at: 0)
+    {
+      out["SubnetMask"] = ip
+    }
+    if let data = dhcp["Option_6"] as? Data, data.count >= 4 {
+      var servers: [String] = []
+      var i = 0
+      while i + 4 <= data.count {
+        if let ip = ipv4Option(data, at: i) { servers.append(ip) }
+        i += 4
+      }
+      if !servers.isEmpty { out["DNSServers"] = servers }
+    }
+    if let data = dhcp["Option_15"] as? Data,
+      let domain = String(data: data, encoding: .utf8), !domain.isEmpty
+    {
+      out["DomainName"] = domain
+    }
+    return out
+  }
+
+  /// Dotted-quad decode of a 4-byte DHCP option blob at `offset`.
+  private func ipv4Option(_ data: Data, at offset: Int) -> String? {
+    guard offset + 4 <= data.count else { return nil }
+    return data[offset..<offset + 4].map(String.init).joined(separator: ".")
+  }
+
+  /// System boot time via KERN_BOOTTIME — the "since boot" anchor for
+  /// the interface byte counters.
+  private func bootTime() -> TimeInterval? {
+    var mib: [Int32] = [CTL_KERN, KERN_BOOTTIME]
+    var boot = timeval()
+    var size = MemoryLayout<timeval>.size
+    guard sysctl(&mib, UInt32(mib.count), &boot, &size, nil, 0) == 0
+    else { return nil }
+    return TimeInterval(boot.tv_sec) + TimeInterval(boot.tv_usec) / 1_000_000
+  }
+
+  /// Walks an IFLIST2 dump; for each if_msghdr2 invokes `body` with the
+  /// header and a map of RTA_* index -> byte offset of that sockaddr.
+  /// Same record scan as forEachRouteEntry, different header type.
+  private func forEachIfEntry(
+    in data: Data,
+    body: (UnsafePointer<if_msghdr2>, [Int: Int]) -> Void
+  ) {
+    let headerSize = MemoryLayout<if_msghdr2>.size
+    data.withUnsafeBytes { raw in
+      guard let base = raw.baseAddress else { return }
+      var pos = 0
+      while pos + headerSize <= data.count {
+        let ifm = base.advanced(by: pos).assumingMemoryBound(
+          to: if_msghdr2.self)
+        let msglen = Int(ifm.pointee.ifm_msglen)
+        if msglen <= 0 { break }
+
+        var addrs: [Int: Int] = [:]
+        var saPos = pos + headerSize
+        let end = pos + msglen
+        var mask = ifm.pointee.ifm_addrs
+        var bit = 1
+        while mask != 0 && bit <= 0x80 && saPos + 2 <= end {
+          if mask & Int32(bit) != 0 {
+            addrs[bit] = saPos
+            let saLen = Int(
+              base.advanced(by: saPos).assumingMemoryBound(to: sockaddr.self)
+                .pointee.sa_len)
+            saPos += saLen > 0 ? (1 + ((saLen - 1) | 3)) : 4
+          }
+          mask &= ~Int32(bit)
+          bit <<= 1
+        }
+        body(ifm, addrs)
+        pos += msglen
+      }
+    }
   }
 
   // MARK: - getArpTable
@@ -424,7 +948,9 @@ class NetworkPlugin: NSObject, FlutterPlugin {
   }
 
   /// sockaddr_dl laid out as [header 8B][name nlen][addr alen].
-  private func parseSockaddrDL(_ bytes: [UInt8]) -> (name: String, addr: [UInt8])? {
+  private func parseSockaddrDL(_ bytes: [UInt8])
+    -> (name: String, addr: [UInt8], type: Int)?
+  {
     guard bytes.count >= 8 else { return nil }
     let dl = bytes.withUnsafeBytes { raw in
       raw.baseAddress!.assumingMemoryBound(to: sockaddr_dl.self).pointee
@@ -436,6 +962,6 @@ class NetworkPlugin: NSObject, FlutterPlugin {
     let name = String(
       bytes: nameBytes.prefix(while: { $0 != 0 }), encoding: .utf8) ?? ""
     let addr = Array(bytes[(8 + nlen)..<(8 + nlen + alen)])
-    return (name, addr)
+    return (name, addr, Int(dl.sdl_type))
   }
 }
