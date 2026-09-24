@@ -63,11 +63,12 @@ class Win32ToolEngine {
     _job = null;
     if (job != null) {
       // Ask the job to cancel itself; it drains in-flight async probes
-      // and exits. A hard kill is only a fallback — a killed isolate
-      // could leave a pending native echo writing into freed memory.
+      // and exits. A hard kill is only a last resort — a killed isolate
+      // could leave a pending native echo writing into freed heap. The
+      // margin covers the longest plausible probe timeout plus drain.
       _control?.send('cancel');
       _events.add({'type': 'done', 'reason': 'stopped', 'job': _jobId});
-      Timer(const Duration(seconds: 1), () => job.kill());
+      Timer(const Duration(seconds: 15), () => job.kill());
     }
     _control = null;
     _port?.close();
@@ -307,20 +308,21 @@ bool _awaitProbe(Allocator arena, _Probe probe, int timeoutMs) {
   return probe.result != null;
 }
 
-/// Drains every outstanding probe before its arena is freed — the OS
-/// writes the reply buffer asynchronously, so freeing early corrupts
-/// the heap.
+/// Waits for every outstanding probe before its arena is freed — the
+/// OS writes the reply buffer asynchronously (it always completes by
+/// the probe's own timeout), so freeing early corrupts the heap. This
+/// deliberately ignores [_cancelled]: a pending write must land before
+/// its buffer goes away.
 void _drainProbes(Allocator arena, List<_Probe?> probes, int graceMs) {
   final pending = [
     for (var i = 0; i < probes.length; i++)
       if (probes[i] != null && probes[i]!.result == null) i,
   ];
-  if (pending.isEmpty) return;
   final deadline = DateTime.now().add(Duration(milliseconds: graceMs));
   for (final i in pending) {
     final ev = arena<IntPtr>(1)..value = probes[i]!.event;
     var r = 0x102;
-    while (!_cancelled) {
+    while (true) {
       final remain = deadline.difference(DateTime.now()).inMilliseconds;
       if (remain <= 0) break;
       r = w.waitForObjects(ev, 1, remain.clamp(0, 50));
@@ -403,7 +405,9 @@ void _pingIcmp(
         final probe = _fireEcho(arena, handle, v6, dst, destV4, dstSa,
             srcSa, payload, null, interval, dontFrag);
         _awaitProbe(arena, probe, interval);
-        _drainProbes(arena, [probe], 200);
+        // The probe completes by its own timeout at the latest — drain
+        // covers the tail of that window so no write lands post-free.
+        _drainProbes(arena, [probe], interval + 100);
         return probe.result ?? const _EchoTimeout();
       });
       sent++;
@@ -629,8 +633,9 @@ Future<void> _routeJob(
           if (remain > 0) _awaitProbe(arena, probe, remain);
         }
         // Any probe still pending writes into this arena — wait for it
-        // before the arena frees, or the heap is corrupted.
-        _drainProbes(arena, probes, 300);
+        // before the arena frees, or the heap is corrupted. Probes were
+        // fired with timeout=maxDelay, so they complete by then.
+        _drainProbes(arena, probes, maxDelay + 100);
         return [for (var p = 0; p < pph; p++) probes[p]?.result];
       });
 
