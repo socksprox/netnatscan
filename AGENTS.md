@@ -1,6 +1,7 @@
 # AGENTS.md - netnatscan
 
-Flutter macOS app: LAN device scanner in the style of iOS "NetAnalyzer".
+Flutter macOS + Windows app: LAN device scanner in the style of iOS
+"NetAnalyzer".
 
 **Not targeting the App Store** — private APIs, disabling the sandbox,
 and subprocesses are all fair game. **Policy: the public API is always
@@ -27,9 +28,29 @@ responsive nav — vertical sidebar ≥ ~1024px wide, `BottomNavigationBar`
 below. Tabs have **no app bar** — each screen has a top-right row
 (theme toggle in narrow layout + refresh button).
 
-All native access goes through `macos/Runner/NetworkPlugin.swift` on
-MethodChannel `netnatscan/network` — Dart cannot read the ARP table or
+On macOS all native access goes through `macos/Runner/NetworkPlugin.swift`
+on MethodChannel `netnatscan/network` — Dart cannot read the ARP table or
 netmasks, and the sandbox blocks subprocesses (`ping`, `arp`).
+
+On Windows there is no plugin and no sandbox — `lib/services/` implements
+the same channel surface in pure Dart:
+
+- `net_channel.dart` — dispatch facade. Every service calls
+  `NetChannel.invoke*`/`toolsEvents`; on Windows it routes to the FFI
+  backend, elsewhere to the real channels. Tests always take the channel
+  path (`FLUTTER_TEST` env) so `setMockMethodCallHandler` mocks still work.
+- `win32_ffi.dart` — hand-bound structs + syscalls (iphlpapi
+  `GetIpNetTable2`/`GetIfTable2`/`GetBestRoute2`/`Icmp*`, kernel32
+  `WaitForMultipleObjects`/`CreateEventW`, ws2_32, user32 `MessageBeep`)
+  on top of package:win32's generated surface.
+- `win32_backend.dart` — `getNetworkInfo`/`getArpTable`/`getNdpTable`/
+  `triggerNdp`/`getConnectionInfo`/`getWifiNetworks` via
+  GetAdaptersAddresses + registry (proxy/DHCP) + wlanapi.
+- `win32_wlan.dart` — WLAN scan + current-connection metadata
+  (`WlanGetNetworkBssList`/`WlanQueryInterface`), RSN/WPA IE parsing.
+- `win32_tools.dart` — ping/route jobs in a spawned isolate, events via
+  a broadcast Stream. Stop is cooperative (control port + `_cancelled`
+  polled between ≤50 ms wait slices).
 
 - **LAN Scan** — UDP blast → ARP/NDP table → mDNS/SSDP/NBNS/PTR/TLS
   enrichment with scored name pool + standby detection.
@@ -65,10 +86,14 @@ manually (4 places: PBXBuildFile, PBXFileReference, Runner group, Sources phase)
 
 ```bash
 flutter pub get
-flutter analyze          # must be clean (1 pre-existing info lint is OK)
+flutter analyze          # must be clean
 flutter test
 flutter build macos --debug
 open build/macos/Build/Products/Debug/netnatscan.app
+
+flutter build windows --debug
+build\windows\x64\runner\Debug\netnatscan.exe
+dart run tool/smoke_win32.dart   # exercises the FFI backend without the UI
 ```
 
 ## Gotchas
@@ -85,3 +110,25 @@ open build/macos/Build/Products/Debug/netnatscan.app
   and `ListView` children outside the paint extent are skipped too.
   Scope with `find.descendant(..., skipOffstage: false)` or enlarge
   `tester.view.physicalSize` so everything builds.
+- Windows FFI: **never free a buffer while a native call may still write
+  it.** Async `IcmpSendEcho2` writes the reply buffer on completion —
+  `_drainProbes` waits for every outstanding probe's event before the
+  arena frees, even on cancel, or the heap corrupts (crashed
+  `MIB_IPNET_ROW2.get:State` in unrelated calls before this was fixed).
+  `Isolate.kill` is the last-resort fallback only.
+- Windows FFI: GetLastError is not reliable across FFI calls — the
+  trampoline can clobber it. `IcmpSendEcho2` returning 0 is treated as
+  pending unconditionally; a real send failure just never signals the
+  event and resolves as a timeout.
+- Windows FFI: wait events must be **manual-reset** — an auto-reset
+  event's signal is consumed by `WaitForMultipleObjects` before the
+  caller can re-check it.
+- `SO_REUSEPORT` doesn't exist on Windows — `RawDatagramSocket.bind`
+  throws. The mDNS listener socket uses `reusePort: !Platform.isWindows`
+  (SO_REUSEADDR alone suffices there).
+- Windows socket errno ≠ POSIX: ECONNREFUSED is 10061 (not 61),
+  ECONNRESET is 10054 (not 54) — see `_refusedOrReset` in
+  `network_scanner.dart`.
+- Windows Wi-Fi enrichment gaps vs macOS private APIs: no per-BSS noise
+  floor or MLO flags (wlanapi doesn't expose them); security detail comes
+  from RSN/WPA IE parsing + the default auth/cipher pair.
