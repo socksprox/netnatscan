@@ -1,3 +1,4 @@
+// ignore_for_file: avoid_print
 // Focused reproduction for the ipNetTable crash.
 import 'package:netnatscan/services/win32_backend.dart' as b;
 

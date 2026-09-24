@@ -1,3 +1,4 @@
+// ignore_for_file: avoid_print
 // Smoke-test harness for the Windows FFI backend — exercises every
 // `netnatscan/network` method directly (no Flutter binding needed).
 // Run: dart run tool/smoke_win32.dart

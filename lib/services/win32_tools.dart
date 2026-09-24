@@ -3,9 +3,11 @@
 /// maps ({type: start|reply|timeout|note|hop|hopName|done}) through a
 /// broadcast stream instead of an EventChannel.
 ///
-/// Jobs run in a spawned isolate because the ICMP helpers block
-/// (IcmpSendEcho waits up to the timeout per call); stop() kills the
-/// isolate — the same semantics as closing the job's sockets on macOS.
+/// Jobs run in a spawned isolate because the ICMP helpers block. Stop is
+/// cooperative: a control message flips a flag the job polls between
+/// wait slices, and pending async echo calls are always drained before
+/// their buffers are freed — killing a job while an IcmpSendEcho2 write
+/// is in flight would corrupt the heap.
 library;
 
 import 'dart:async';
@@ -25,6 +27,7 @@ class Win32ToolEngine {
   Stream<Map<String, dynamic>> get events => _events.stream;
 
   Isolate? _job;
+  SendPort? _control;
   ReceivePort? _port;
   int _jobId = 0;
 
@@ -38,6 +41,10 @@ class Win32ToolEngine {
     final port = ReceivePort();
     _port = port;
     port.listen((msg) {
+      if (msg is SendPort) {
+        _control = msg;
+        return;
+      }
       if (msg is! Map) return;
       final e = Map<String, dynamic>.from(msg);
       if (e['type'] == 'done') _job = null;
@@ -55,11 +62,14 @@ class Win32ToolEngine {
     final job = _job;
     _job = null;
     if (job != null) {
-      job.kill();
-      // A killed isolate can't report its own death — synthesize the
-      // done event the native cancel path produces.
+      // Ask the job to cancel itself; it drains in-flight async probes
+      // and exits. A hard kill is only a fallback — a killed isolate
+      // could leave a pending native echo writing into freed memory.
+      _control?.send('cancel');
       _events.add({'type': 'done', 'reason': 'stopped', 'job': _jobId});
+      Timer(const Duration(seconds: 1), () => job.kill());
     }
+    _control = null;
     _port?.close();
     _port = null;
   }
@@ -67,11 +77,20 @@ class Win32ToolEngine {
 
 // -- job isolate -----------------------------------------------------------------
 
+bool _cancelled = false;
+
 Future<void> _toolMain(Map init) async {
   final send = init['send'] as SendPort;
   final method = init['method'] as String;
   final args = Map<String, dynamic>.from(init['args'] as Map);
   final jobId = (args['job'] as num?)?.toInt() ?? 0;
+
+  // Control channel back to the engine: 'cancel' sets _cancelled. The
+  // flag is polled between <=50ms wait slices so cancellation lands even
+  // while a native wait is outstanding.
+  final control = ReceivePort();
+  control.listen((_) => _cancelled = true);
+  send.send(control.sendPort);
 
   void emit(Map<String, Object?> e) =>
       send.send(<String, Object?>{...e, 'job': jobId});
@@ -156,6 +175,168 @@ void _finishPing(void Function(Map<String, Object?>) emit, int sent,
   });
 }
 
+// -- async echo primitives --------------------------------------------------------
+
+/// One echo probe's outstanding state.
+final class _Probe {
+  final bool v6;
+  int event = 0;
+  Pointer<Uint8> reply = nullptr;
+  _EchoResult? result; // set once resolved
+  _Probe({required this.v6});
+}
+
+sealed class _EchoResult {
+  const _EchoResult();
+}
+
+final class _EchoReply extends _EchoResult {
+  final String? from;
+  final double? rttMs;
+  final int? ttl;
+  const _EchoReply(this.from, this.rttMs, this.ttl);
+}
+
+final class _EchoTimeout extends _EchoResult {
+  const _EchoTimeout();
+}
+
+final class _EchoError extends _EchoResult {
+  final int status;
+  const _EchoError(this.status);
+}
+
+/// Fires one async echo on [handle]; [v6] picks the address family.
+/// [ttl] bounds the probe for route jobs; null means a full ping.
+/// The returned [_Probe]'s result is already set if the call completed
+/// inline or the send failed ([_EchoError]).
+_Probe _fireEcho(
+    Allocator arena,
+    int handle,
+    bool v6,
+    InternetAddress dst,
+    int destV4,
+    Pointer<w.SOCKADDR_IN6> dstSa,
+    Pointer<w.SOCKADDR_IN6> srcSa,
+    int payload,
+    int? ttl,
+    int timeout,
+    bool dontFrag) {
+  final req = arena<Uint8>(payload.clamp(0, 65535));
+  for (var i = 0; i < payload; i++) {
+    req[i] = i & 0xff;
+  }
+  final opt = arena<w.IP_OPTION_INFORMATION>();
+  opt.ref
+    ..Ttl = ttl ?? 128
+    ..Tos = 0
+    ..Flags = dontFrag ? w.ipFlagDf : 0
+    ..OptionsSize = 0
+    ..OptionsData = nullptr;
+  final replySize = v6
+      ? sizeOf<w.ICMPV6_ECHO_REPLY>() + payload + 8
+      : sizeOf<w.ICMP_ECHO_REPLY>() + payload + 8;
+  final reply = arena<Uint8>(replySize);
+  final event = w.createEvent();
+  final r = v6
+      ? w.icmp6SendEcho2Async(
+          handle, event, srcSa, dstSa, req, payload, opt, reply, replySize,
+          timeout)
+      : w.icmpSendEcho2(
+          handle, event, destV4, req, payload, opt, reply, replySize,
+          timeout);
+  final probe = _Probe(v6: v6)
+    ..event = event
+    ..reply = reply;
+  if (r > 0) {
+    probe.result = _parseEcho(reply, v6);
+  } else {
+    final err = w.wsaGetLastError();
+    if (err != 997 /* ERROR_IO_PENDING */) {
+      probe.result = _EchoError(err);
+    }
+  }
+  return probe;
+}
+
+_EchoResult _parseEcho(Pointer<Uint8> reply, bool v6) =>
+    v6 ? _parse6(reply) : _parse4(reply);
+
+_EchoResult _parse4(Pointer<Uint8> reply) {
+  final r = reply.cast<w.ICMP_ECHO_REPLY>().ref;
+  if (r.Status == w.ipSuccess || r.Status == w.ipTtlExpiredTransit) {
+    final a = r.Address;
+    return _EchoReply(
+        '${a & 255}.${(a >> 8) & 255}.${(a >> 16) & 255}.${(a >> 24) & 255}',
+        r.RoundTripTime.toDouble(),
+        r.Options.Ttl);
+  }
+  if (r.Status == w.ipReqTimedOut) return const _EchoTimeout();
+  return _EchoError(r.Status);
+}
+
+_EchoResult _parse6(Pointer<Uint8> reply) {
+  final r = reply.cast<w.ICMPV6_ECHO_REPLY>().ref;
+  if (r.Status == w.ipSuccess || r.Status == w.ipTtlExpiredTransit) {
+    final ip = w.inetNtopString(w.afInet6, reply);
+    return _EchoReply(ip ?? '?', r.RoundTripTime.toDouble(), null);
+  }
+  if (r.Status == w.ipReqTimedOut) return const _EchoTimeout();
+  return _EchoError(r.Status);
+}
+
+/// Waits for [probe]'s event in <=50ms slices so the cancel flag is
+/// polled even while a native wait is outstanding. Returns true once the
+/// probe resolved (sync, signalled, or timed out at the deadline).
+bool _awaitProbe(Allocator arena, _Probe probe, int timeoutMs) {
+  if (probe.result != null) return true;
+  final ev = arena<IntPtr>(1)..value = probe.event;
+  final deadline = DateTime.now().add(Duration(milliseconds: timeoutMs));
+  while (!_cancelled) {
+    final remain = deadline.difference(DateTime.now()).inMilliseconds;
+    if (remain <= 0) break;
+    final r = w.waitForObjects(ev, 1, remain.clamp(0, 50));
+    if (r == 0) {
+      // WAIT_OBJECT_0 — the reply buffer is complete now.
+      probe.result = _parseEcho(probe.reply, probe.v6);
+      return true;
+    }
+    if (r == 0x102 /* WAIT_TIMEOUT */) continue;
+    if (r == 0xFFFFFFFF /* WAIT_FAILED */) break;
+  }
+  // Deadline or cancel: the call may still complete asynchronously, but
+  // we keep the event open until _drainProbes has confirmed the write.
+  return probe.result != null;
+}
+
+/// Drains every outstanding probe before its arena is freed — the OS
+/// writes the reply buffer asynchronously, so freeing early corrupts
+/// the heap.
+void _drainProbes(Allocator arena, List<_Probe?> probes, int graceMs) {
+  final pending = [
+    for (var i = 0; i < probes.length; i++)
+      if (probes[i] != null && probes[i]!.result == null) i,
+  ];
+  if (pending.isEmpty) return;
+  final deadline = DateTime.now().add(Duration(milliseconds: graceMs));
+  for (final i in pending) {
+    final ev = arena<IntPtr>(1)..value = probes[i]!.event;
+    var r = 0x102;
+    while (!_cancelled) {
+      final remain = deadline.difference(DateTime.now()).inMilliseconds;
+      if (remain <= 0) break;
+      r = w.waitForObjects(ev, 1, remain.clamp(0, 50));
+      if (r != 0x102) break;
+    }
+    if (r == 0) {
+      probes[i]!.result = _parseEcho(probes[i]!.reply, probes[i]!.v6);
+    }
+  }
+  for (final p in probes) {
+    if (p != null) w.closeHandle(p.event);
+  }
+}
+
 // -- ping ---------------------------------------------------------------------
 
 Future<void> _pingJob(
@@ -191,9 +372,8 @@ Future<void> _pingJob(
   }
 }
 
-/// ICMP echo via IcmpSendEcho / Icmp6SendEcho2 — each call blocks up to
-/// `interval` ms, which doubles as the probe cadence (same semantics as
-/// the SOCK_DGRAM loop on macOS).
+/// ICMP echo via IcmpSendEcho2 — each probe waits up to `interval` ms in
+/// cancel-pollable slices, which doubles as the probe cadence.
 void _pingIcmp(
     void Function(Map<String, Object?>) emit,
     InternetAddress dst,
@@ -211,119 +391,46 @@ void _pingIcmp(
   try {
     final rtts = <double>[];
     var sent = 0;
-    for (var seq = 0; seq < count; seq++) {
-      final r = v6
-          ? _echo6(handle, dst, payload, null, interval, dontFrag)
-          : _echo4(handle, dst, payload, null, interval, dontFrag);
+    var destV4 = 0;
+    if (!v6) {
+      final a = dst.rawAddress;
+      destV4 = a[0] | a[1] << 8 | a[2] << 16 | a[3] << 24;
+    }
+    for (var seq = 0; seq < count && !_cancelled; seq++) {
+      final r = using((arena) {
+        final dstSa =
+            v6 ? w.sockaddrIn6(arena, dst, scopeId: _scopeIdOf(dst)) : nullptr;
+        final srcSa =
+            v6 ? w.sockaddrIn6(arena, InternetAddress('::')) : nullptr;
+        final probe = _fireEcho(arena, handle, v6, dst, destV4, dstSa,
+            srcSa, payload, null, interval, dontFrag);
+        _awaitProbe(arena, probe, interval);
+        _drainProbes(arena, [probe], 200);
+        return probe.result ?? const _EchoTimeout();
+      });
       sent++;
       switch (r) {
-        case _EchoReply(:final from!, :final rttMs!):
-          _emitReply(emit, seq, from, rttMs, null, audible, ttl: r.ttl);
-          rtts.add(rttMs);
+        case _EchoReply(:final from, :final rttMs):
+          if (from != null && rttMs != null) {
+            _emitReply(emit, seq, from, rttMs, null, audible, ttl: r.ttl);
+            rtts.add(rttMs);
+          } else {
+            emit({'type': 'timeout', 'seq': seq});
+          }
         case _EchoTimeout():
           emit({'type': 'timeout', 'seq': seq});
         case _EchoError(:final status):
-          emit({'type': 'note', 'message': 'seq $seq: ${_icmpStatus(status)}'});
+          emit({
+            'type': 'note',
+            'message': 'seq $seq: ${_icmpStatus(status)}'
+          });
       }
     }
-    _finishPing(emit, sent, rtts, 'finished');
+    _finishPing(
+        emit, sent, rtts, _cancelled ? 'stopped' : 'finished');
   } finally {
     w.icmpCloseHandle(handle);
   }
-}
-
-/// One blocking echo. [ttl] bounds the probe (route job); null = 128.
-sealed class _EchoResult {
-  const _EchoResult();
-}
-
-final class _EchoReply extends _EchoResult {
-  final String? from;
-  final double? rttMs;
-  final int? ttl;
-  const _EchoReply(this.from, this.rttMs, this.ttl);
-}
-
-final class _EchoTimeout extends _EchoResult {
-  const _EchoTimeout();
-}
-
-final class _EchoError extends _EchoResult {
-  final int status;
-  const _EchoError(this.status);
-}
-
-_EchoResult _echo4(int handle, InternetAddress dst, int payload, int? ttl,
-    int timeout, bool dontFrag) {
-  return using((arena) {
-    final req = arena<Uint8>(payload.clamp(0, 65535));
-    for (var i = 0; i < payload; i++) {
-      req[i] = i & 0xff;
-    }
-    final opt = arena<w.IP_OPTION_INFORMATION>();
-    opt.ref
-      ..Ttl = ttl ?? 128
-      ..Tos = 0
-      ..Flags = dontFrag ? w.ipFlagDf : 0
-      ..OptionsSize = 0
-      ..OptionsData = nullptr;
-    final replySize = sizeOf<w.ICMP_ECHO_REPLY>() + payload + 8;
-    final reply = arena<Uint8>(replySize);
-    final addr = dst.rawAddress;
-    final dest = addr[0] | addr[1] << 8 | addr[2] << 16 | addr[3] << 24;
-    final n = w.icmpSendEcho(
-        handle, dest, req, payload, opt, reply, replySize, timeout);
-    if (n == 0) return const _EchoTimeout();
-    final r = reply.cast<w.ICMP_ECHO_REPLY>().ref;
-    if (r.Status == w.ipSuccess) {
-      final a = r.Address;
-      return _EchoReply(
-          '${a & 255}.${(a >> 8) & 255}.${(a >> 16) & 255}.${(a >> 24) & 255}',
-          r.RoundTripTime.toDouble(),
-          r.Options.Ttl);
-    }
-    if (r.Status == w.ipReqTimedOut) return const _EchoTimeout();
-    if (r.Status == w.ipTtlExpiredTransit) {
-      final a = r.Address;
-      return _EchoReply(
-          '${a & 255}.${(a >> 8) & 255}.${(a >> 16) & 255}.${(a >> 24) & 255}',
-          r.RoundTripTime.toDouble(),
-          null);
-    }
-    return _EchoError(r.Status);
-  });
-}
-
-_EchoResult _echo6(int handle, InternetAddress dst, int payload, int? ttl,
-    int timeout, bool dontFrag) {
-  return using((arena) {
-    final req = arena<Uint8>(payload.clamp(0, 65535));
-    for (var i = 0; i < payload; i++) {
-      req[i] = i & 0xff;
-    }
-    final opt = arena<w.IP_OPTION_INFORMATION>();
-    opt.ref
-      ..Ttl = ttl ?? 128
-      ..Tos = 0
-      ..Flags = dontFrag ? w.ipFlagDf : 0
-      ..OptionsSize = 0
-      ..OptionsData = nullptr;
-    final replySize = sizeOf<w.ICMPV6_ECHO_REPLY>() + payload + 8;
-    final reply = arena<Uint8>(replySize);
-    final src = w.sockaddrIn6(arena, InternetAddress('::'));
-    final dstSa = w.sockaddrIn6(arena, dst, scopeId: _scopeIdOf(dst));
-    final n = w.icmp6SendEcho2(
-        handle, src, dstSa, req, payload, opt, reply, replySize, timeout);
-    if (n == 0) return const _EchoTimeout();
-    final r = reply.cast<w.ICMPV6_ECHO_REPLY>().ref;
-    if (r.Status == w.ipSuccess || r.Status == w.ipTtlExpiredTransit) {
-      final addrBytes = reply.cast<Uint8>();
-      final ip = w.inetNtopString(w.afInet6, addrBytes);
-      return _EchoReply(ip ?? '?', r.RoundTripTime.toDouble(), null);
-    }
-    if (r.Status == w.ipReqTimedOut) return const _EchoTimeout();
-    return _EchoError(r.Status);
-  });
 }
 
 /// TCP ping — a completed or refused connect both prove the host is up.
@@ -336,7 +443,7 @@ Future<void> _pingTcp(
     bool audible) async {
   final rtts = <double>[];
   var sent = 0;
-  for (var seq = 0; seq < count; seq++) {
+  for (var seq = 0; seq < count && !_cancelled; seq++) {
     final sw = Stopwatch()..start();
     var answered = false;
     sent++;
@@ -360,9 +467,11 @@ Future<void> _pingTcp(
     } catch (_) {}
     if (!answered) emit({'type': 'timeout', 'seq': seq});
     final rest = interval - sw.elapsedMilliseconds;
-    if (rest > 0) await Future.delayed(Duration(milliseconds: rest));
+    for (var waited = 0; waited < rest && !_cancelled; waited += 50) {
+      await Future.delayed(Duration(milliseconds: (rest - waited).clamp(0, 50)));
+    }
   }
-  _finishPing(emit, sent, rtts, 'finished');
+  _finishPing(emit, sent, rtts, _cancelled ? 'stopped' : 'finished');
 }
 
 /// UDP ping — a datagram to a (usually closed) port; the host's ICMP
@@ -378,7 +487,7 @@ void _pingUdp(
     bool audible) {
   final rtts = <double>[];
   var sent = 0;
-  for (var seq = 0; seq < count; seq++) {
+  for (var seq = 0; seq < count && !_cancelled; seq++) {
     final sw = Stopwatch()..start();
     var answered = false;
     using((arena) {
@@ -392,8 +501,7 @@ void _pingUdp(
       }
       try {
         final sa = v6
-            ? w.sockaddrIn6(arena, dst,
-                scopeId: _scopeIdOf(dst), port: port)
+            ? w.sockaddrIn6(arena, dst, scopeId: _scopeIdOf(dst), port: port)
             : _sockaddrIn4(arena, dst, port);
         final saLen = v6 ? 28 : 16;
         if (w.wsaConnect(fd, sa, saLen) != 0) {
@@ -404,26 +512,39 @@ void _pingUdp(
           return;
         }
         final timeout = arena<Uint32>()..value = interval;
-        w.wsaSetsockopt(
-            fd, w.solSocket, w.soRcvtimeo, timeout.cast(), 4);
+        w.wsaSetsockopt(fd, w.solSocket, w.soRcvtimeo, timeout.cast(), 4);
         final payload = arena<Uint8>(1);
         if (w.wsaSend(fd, payload, 1, 0) < 0) return;
         sent++;
-        final buf = arena<Uint8>(64);
-        final n = w.wsaRecv(fd, buf, 64, 0);
-        final rtt = sw.elapsedMilliseconds.toDouble();
-        if (n > 0) {
-          _emitReply(emit, seq, dst.address, rtt, 'data', audible);
-          rtts.add(rtt);
-          answered = true;
-        } else {
+        // Poll recv in slices so cancel stays responsive — recv blocks
+        // up to SO_RCVTIMEO otherwise.
+        final deadline =
+            DateTime.now().add(Duration(milliseconds: interval));
+        while (!_cancelled) {
+          final remain =
+              deadline.difference(DateTime.now()).inMilliseconds;
+          if (remain <= 0) break;
+          final timeout50 = arena<Uint32>()..value = remain.clamp(0, 50);
+          w.wsaSetsockopt(
+              fd, w.solSocket, w.soRcvtimeo, timeout50.cast(), 4);
+          final buf = arena<Uint8>(64);
+          final n = w.wsaRecv(fd, buf, 64, 0);
+          final rtt = sw.elapsedMilliseconds.toDouble();
+          if (n > 0) {
+            _emitReply(emit, seq, dst.address, rtt, 'data', audible);
+            rtts.add(rtt);
+            answered = true;
+            return;
+          }
           final err = w.wsaGetLastError();
           if (err == w.wsaEconnreset) {
             _emitReply(
                 emit, seq, dst.address, rtt, 'port unreachable', audible);
             rtts.add(rtt);
             answered = true;
+            return;
           }
+          if (err != w.wsaEtimedout) return; // other error → give up
         }
       } finally {
         w.wsaClose(fd);
@@ -431,17 +552,17 @@ void _pingUdp(
     });
     if (!answered) emit({'type': 'timeout', 'seq': seq});
     final rest = interval - sw.elapsedMilliseconds;
-    if (rest > 0) w.sleepMs(rest);
+    if (rest > 0 && !_cancelled) w.sleepMs(rest.clamp(0, 50));
   }
-  _finishPing(emit, sent, rtts, 'finished');
+  _finishPing(emit, sent, rtts, _cancelled ? 'stopped' : 'finished');
 }
 
 // -- route ----------------------------------------------------------------------
 
 /// ICMP traceroute — one batched async send per hop via
-/// IcmpSendEcho2/Icmp6SendEchoistry events, then collect until every
-/// probe answered or maxDelay elapsed. UDP-probe mode falls back to
-/// ICMP (raw sockets need admin on Windows, same as the macOS sandbox).
+/// IcmpSendEcho2/Icmp6SendEcho2 events, then collect until every probe
+/// answered or maxDelay elapsed. UDP-probe mode falls back to ICMP (raw
+/// sockets need admin on Windows, same as the macOS sandbox).
 Future<void> _routeJob(
     void Function(Map<String, Object?>) emit,
     InternetAddress dst,
@@ -474,93 +595,56 @@ Future<void> _routeJob(
     return;
   }
 
-  final hopResults = <int, List<Map<String, Object?>?>>{};
   final nameCache = <String, String>{};
   var reached = false;
   var hopsDone = 0;
 
   try {
-    for (var hop = 1; hop <= maxHops && !reached; hop++) {
+    var destV4 = 0;
+    if (!v6) {
+      final a = dst.rawAddress;
+      destV4 = a[0] | a[1] << 8 | a[2] << 16 | a[3] << 24;
+    }
+    for (var hop = 1; hop <= maxHops && !reached && !_cancelled; hop++) {
       // Fire all probes of this hop back-to-back on event handles.
       final results = using((arena) {
-        final events = arena<IntPtr>(pph);
-        final replies = arena<Uint8>(pph * 512);
-        final opts = arena<w.IP_OPTION_INFORMATION>(pph);
-        final out = List<_EchoResult?>.filled(pph, null);
-        final replySize = v6
-            ? sizeOf<w.ICMPV6_ECHO_REPLY>() + 32 + 8
-            : sizeOf<w.ICMP_ECHO_REPLY>() + 24 + 8;
-        final payload = v6 ? 32 : 24;
-        final dstSa = v6 ? w.sockaddrIn6(arena, dst, scopeId: _scopeIdOf(dst)) : nullptr;
-        final srcSa = v6 ? w.sockaddrIn6(arena, InternetAddress('::')) : nullptr;
-        var destV4 = 0;
-        if (!v6) {
-          final a = dst.rawAddress;
-          destV4 = a[0] | a[1] << 8 | a[2] << 16 | a[3] << 24;
-        }
-        var pending = 0;
+        final probes = List<_Probe?>.filled(pph, null);
+        final dstSa = v6
+            ? w.sockaddrIn6(arena, dst, scopeId: _scopeIdOf(dst))
+            : nullptr;
+        final srcSa =
+            v6 ? w.sockaddrIn6(arena, InternetAddress('::')) : nullptr;
         var sendErr = 0;
         for (var p = 0; p < pph; p++) {
-          events[p] = w.createEvent();
-          final opt = opts + p;
-          opt.ref
-            ..Ttl = hop
-            ..Tos = 0
-            ..Flags = 0
-            ..OptionsSize = 0
-            ..OptionsData = nullptr;
-          final req = arena<Uint8>(payload);
-          for (var i = 0; i < payload; i++) {
-            req[i] = i & 0xff;
+          final probe = _fireEcho(arena, handle, v6, dst, destV4, dstSa,
+              srcSa, v6 ? 32 : 24, hop, maxDelay, false);
+          if (probe.result case _EchoError(:final status)) {
+            sendErr = status;
           }
-          final reply = replies + p * 512;
-          final r = v6
-              ? w.icmp6SendEcho2Async(handle, events[p], srcSa, dstSa, req,
-                  payload, opt, reply, replySize, maxDelay)
-              : w.icmpSendEcho2(handle, events[p], destV4, req, payload,
-                  opt, reply, replySize, maxDelay);
-          if (r > 0) {
-            // Completed inline — the reply buffer is already valid.
-            out[p] = v6 ? _parse6(reply) : _parse4(reply);
-          } else if (w.wsaGetLastError() == 997 /* ERROR_IO_PENDING */) {
-            pending++;
-          } else {
-            out[p] = _EchoError(w.wsaGetLastError());
-            sendErr = w.wsaGetLastError();
-          }
+          probes[p] = probe;
           if (p + 1 < pph && minDelay > 0) w.sleepMs(minDelay);
         }
         if (sendErr != 0) {
-          emit({'type': 'note', 'message': 'probe send failed: $sendErr'});
+          emit({
+            'type': 'note',
+            'message': 'probe send failed: $sendErr'
+          });
         }
 
         // Collect until all answered or the deadline passes.
         final deadline =
             DateTime.now().add(Duration(milliseconds: maxDelay));
-        while (pending > 0) {
+        for (var p = 0; p < pph; p++) {
+          final probe = probes[p];
+          if (probe == null) continue;
           final remain =
               deadline.difference(DateTime.now()).inMilliseconds;
-          if (remain <= 0) break;
-          final signaled =
-              w.waitForObjects(events, pph, remain.clamp(0, maxDelay));
-          if (signaled == 0xFFFFFFFF /* WAIT_FAILED */ ||
-              signaled == 0x102 /* WAIT_TIMEOUT */) {
-            break;
-          }
-          for (var p = 0; p < pph; p++) {
-            if (out[p] != null) continue;
-            final evPtr = arena<IntPtr>(1)..value = events[p];
-            if (w.waitForObjects(evPtr, 1, 0) != 0) continue;
-            out[p] = v6
-                ? _parse6(replies + p * 512)
-                : _parse4(replies + p * 512);
-            pending--;
-          }
+          if (remain > 0) _awaitProbe(arena, probe, remain);
         }
-        for (final ev in List.generate(pph, (i) => events[i])) {
-          w.closeHandle(ev);
-        }
-        return out;
+        // Any probe still pending writes into this arena — wait for it
+        // before the arena frees, or the heap is corrupted.
+        _drainProbes(arena, probes, 300);
+        return [for (var p = 0; p < pph; p++) probes[p]?.result];
       });
 
       // Map results onto the hop's probe list + emit.
@@ -572,7 +656,6 @@ Future<void> _routeJob(
             _ => null,
           },
       ];
-      hopResults[hop] = probes;
       for (final r in results) {
         if (r is _EchoReply && r.from == dst.address) reached = true;
       }
@@ -603,33 +686,10 @@ Future<void> _routeJob(
 
   emit({
     'type': 'done',
-    'reason': 'finished',
+    'reason': _cancelled ? 'stopped' : 'finished',
     'hops': hopsDone,
     'reached': reached,
   });
-}
-
-_EchoResult _parse4(Pointer<Uint8> reply) {
-  final r = reply.cast<w.ICMP_ECHO_REPLY>().ref;
-  if (r.Status == w.ipSuccess || r.Status == w.ipTtlExpiredTransit) {
-    final a = r.Address;
-    return _EchoReply(
-        '${a & 255}.${(a >> 8) & 255}.${(a >> 16) & 255}.${(a >> 24) & 255}',
-        r.RoundTripTime.toDouble(),
-        r.Options.Ttl);
-  }
-  if (r.Status == w.ipReqTimedOut) return const _EchoTimeout();
-  return _EchoError(r.Status);
-}
-
-_EchoResult _parse6(Pointer<Uint8> reply) {
-  final r = reply.cast<w.ICMPV6_ECHO_REPLY>().ref;
-  if (r.Status == w.ipSuccess || r.Status == w.ipTtlExpiredTransit) {
-    final ip = w.inetNtopString(w.afInet6, reply);
-    return _EchoReply(ip ?? '?', r.RoundTripTime.toDouble(), null);
-  }
-  if (r.Status == w.ipReqTimedOut) return const _EchoTimeout();
-  return _EchoError(r.Status);
 }
 
 Pointer _sockaddrIn4(Allocator arena, InternetAddress addr, int port) {
