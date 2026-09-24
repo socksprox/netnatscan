@@ -78,7 +78,9 @@ class MdnsDiscovery {
         InternetAddress.anyIPv4,
         _port,
         reuseAddress: true,
-        reusePort: true,
+        // SO_REUSEPORT doesn't exist on Windows — SO_REUSEADDR alone
+        // is enough to share the mDNS port there.
+        reusePort: !Platform.isWindows,
       );
       try {
         final ifaces = await NetworkInterface.list(

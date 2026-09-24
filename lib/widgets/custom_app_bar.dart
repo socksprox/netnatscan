@@ -65,7 +65,7 @@ class CustomAppBar extends StatelessWidget implements PreferredSizeWidget {
                 fontWeight: FontWeight.w600,
               ),
               const Spacer(),
-              if (actions != null) ...actions!,
+              ...?actions,
             ],
           ),
         ),

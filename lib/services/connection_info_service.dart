@@ -3,8 +3,8 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
-import 'package:flutter/services.dart';
 
+import 'net_channel.dart';
 import 'network_scanner.dart';
 import 'oui_db.dart';
 
@@ -338,7 +338,6 @@ class ConnectionInfo {
 /// `reload` is the full refresh (incl. public IP); `refreshStats` is the
 /// cheap counter tick the info tab's timer drives for live rates.
 class ConnectionInfoService extends ChangeNotifier {
-  static const _channel = MethodChannel('netnatscan/network');
 
   ConnectionInfo? info;
   NetworkInfo? network;
@@ -365,9 +364,7 @@ class ConnectionInfoService extends ChangeNotifier {
     loading = true;
     try {
       await OuiDb.instance.load();
-      final raw = await _channel.invokeMapMethod<String, dynamic>(
-        'getConnectionInfo',
-      );
+      final raw = await NetChannel.invokeMap('getConnectionInfo');
       if (raw != null) {
         final next = ConnectionInfo.fromMap(raw);
         if (info == null ||
@@ -412,9 +409,7 @@ class ConnectionInfoService extends ChangeNotifier {
 
   Future<void> _refreshNetworkInfo() async {
     try {
-      final res = await _channel.invokeMapMethod<String, dynamic>(
-        'getNetworkInfo',
-      );
+      final res = await NetChannel.invokeMap('getNetworkInfo');
       final ifaces =
           (res?['interfaces'] as List?)
               ?.map((e) => InterfaceInfo.fromMap(e as Map))
@@ -436,11 +431,7 @@ class ConnectionInfoService extends ChangeNotifier {
     final gw = info?.defaultGateway;
     if (gw == null) return;
     try {
-      final rows =
-          await _channel.invokeListMethod<Map<dynamic, dynamic>>(
-            'getArpTable',
-          ) ??
-          [];
+      final rows = await NetChannel.invokeList('getArpTable') ?? [];
       for (final r in rows) {
         if (r['ip'] == gw) {
           gatewayMac = r['mac'] as String?;

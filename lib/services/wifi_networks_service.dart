@@ -1,6 +1,6 @@
 import 'package:flutter/foundation.dart';
-import 'package:flutter/services.dart';
 
+import 'net_channel.dart';
 import 'oui_db.dart';
 
 /// One nearby BSS from the `getWifiNetworks` scan — public CoreWLAN
@@ -202,7 +202,6 @@ class WifiNetwork {
 /// Periodic Wi-Fi neighbourhood scan. Each scan is a real radio scan
 /// (~1-2s inside airportd), so callers pace it — the screen ticks 10s.
 class WifiNetworksService extends ChangeNotifier {
-  static const _channel = MethodChannel('netnatscan/network');
 
   List<WifiNetwork> networks = [];
   String? interfaceName;
@@ -228,9 +227,7 @@ class WifiNetworksService extends ChangeNotifier {
     _notify();
     try {
       await OuiDb.instance.load();
-      final res = await _channel.invokeMapMethod<String, dynamic>(
-        'getWifiNetworks',
-      );
+      final res = await NetChannel.invokeMap('getWifiNetworks');
       if (res != null) {
         interfaceName = res['interfaceName'] as String?;
         final list = (res['networks'] as List? ?? const [])

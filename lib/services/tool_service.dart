@@ -6,6 +6,8 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
+import 'net_channel.dart';
+
 /// Which built-in tool produced a run.
 enum ToolKind { ping, route }
 
@@ -188,8 +190,6 @@ class ToolRun {
 /// `netnatscan/tools_events` for streamed replies/hops) and keeps a
 /// persisted history of finished runs.
 class ToolService extends ChangeNotifier {
-  static const _methods = MethodChannel('netnatscan/network');
-  static const _events = EventChannel('netnatscan/tools_events');
   static const _historyCap = 50;
 
   ToolRun? active;
@@ -203,7 +203,7 @@ class ToolService extends ChangeNotifier {
   ToolService() {
     // One persistent subscription — events carry a `job` id so stale
     // events from a cancelled job can't corrupt the new active run.
-    _sub = _events.receiveBroadcastStream().listen(_onEvent, onError: (_) {});
+    _sub = NetChannel.toolsEvents.listen(_onEvent, onError: (_) {});
     loadHistory();
   }
 
@@ -218,7 +218,7 @@ class ToolService extends ChangeNotifier {
     _disposed = true;
     _sub?.cancel();
     // Best-effort stop so a native job doesn't outlive the screen.
-    _methods.invokeMethod('stopTool').catchError((_) {});
+    NetChannel.invoke('stopTool').catchError((_) {});
     super.dispose();
   }
 
@@ -246,7 +246,7 @@ class ToolService extends ChangeNotifier {
     active = run;
     _notify();
     try {
-      final res = await _methods.invokeMapMethod<String, dynamic>(method, {
+      final res = await NetChannel.invokeMap(method, {
         ...config,
         'host': target,
         'job': jobId,
@@ -268,7 +268,7 @@ class ToolService extends ChangeNotifier {
   Future<void> stop() async {
     if (!running) return;
     try {
-      await _methods.invokeMethod('stopTool');
+      await NetChannel.invoke('stopTool');
     } catch (_) {
       _finish(active!, 'stopped');
     }

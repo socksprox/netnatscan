@@ -3,14 +3,20 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
-import 'package:flutter/services.dart';
 
 import '../models/network_device.dart';
 import 'mdns_discovery.dart';
 import 'name_cache.dart';
 import 'nbns_discovery.dart';
+import 'net_channel.dart';
 import 'oui_db.dart';
 import 'ssdp_discovery.dart';
+
+/// ECONNREFUSED/ECONNRESET (61/54 on macOS, 10061/10054 on Windows) —
+/// a refused or reset TCP connect still proves the host is alive.
+bool _refusedOrReset(int? errorCode) =>
+    errorCode == 61 || errorCode == 54 ||
+    errorCode == 10061 || errorCode == 10054;
 
 /// One local network interface as reported by the macOS side.
 class InterfaceInfo {
@@ -129,7 +135,6 @@ class ScanProgress {
 ///    live devices with real MAC addresses.
 /// 4. Enrich: OUI vendor, reverse-DNS hostname, TCP connect latency.
 class NetworkScanner extends ChangeNotifier {
-  static const _channel = MethodChannel('netnatscan/network');
   static const _maxHosts = 4096; // cap the sweep, /16 subnets get truncated
 
   NetworkInfo? network;
@@ -145,9 +150,7 @@ class NetworkScanner extends ChangeNotifier {
 
   Future<void> refreshNetworkInfo() async {
     try {
-      final res = await _channel.invokeMapMethod<String, dynamic>(
-        'getNetworkInfo',
-      );
+      final res = await NetChannel.invokeMap('getNetworkInfo');
       final ifaces =
           (res?['interfaces'] as List?)
               ?.map((e) => InterfaceInfo.fromMap(e as Map))
@@ -250,9 +253,7 @@ class NetworkScanner extends ChangeNotifier {
     // --- Phase 2: ARP table -> devices. ---
     List<Map<dynamic, dynamic>> arpRows;
     try {
-      final res = await _channel.invokeListMethod<Map<dynamic, dynamic>>(
-        'getArpTable',
-      );
+      final res = await NetChannel.invokeList('getArpTable');
       arpRows = res ?? [];
     } catch (e) {
       error = 'Could not read ARP table: $e';
@@ -562,7 +563,7 @@ class NetworkScanner extends ChangeNotifier {
   Future<void> _triggerIpv6Ndp(InterfaceInfo iface) async {
     if (iface.ipv6.isEmpty) return;
     try {
-      await _channel.invokeMethod('triggerNdp', iface.name);
+      await NetChannel.invoke('triggerNdp', iface.name);
     } catch (_) {}
   }
 
@@ -573,11 +574,7 @@ class NetworkScanner extends ChangeNotifier {
   Future<void> _applyNdpTable() async {
     List<Map<dynamic, dynamic>> rows;
     try {
-      rows =
-          await _channel.invokeListMethod<Map<dynamic, dynamic>>(
-            'getNdpTable',
-          ) ??
-          [];
+      rows = await NetChannel.invokeList('getNdpTable') ?? [];
     } catch (_) {
       return;
     }
@@ -811,9 +808,7 @@ class NetworkScanner extends ChangeNotifier {
         return;
       } on SocketException catch (e) {
         sw.stop();
-        if (e.osError?.errorCode == 61 || // ECONNREFUSED
-            e.osError?.errorCode == 54) {
-          // ECONNRESET
+        if (_refusedOrReset(e.osError?.errorCode)) {
           d.rttMs = sw.elapsedMilliseconds;
           return;
         }
@@ -952,7 +947,7 @@ class NetworkScanner extends ChangeNotifier {
             d.rttMs ??= sw.elapsedMilliseconds;
           } on SocketException catch (e) {
             sw.stop();
-            if (e.osError?.errorCode == 61 || e.osError?.errorCode == 54) {
+            if (_refusedOrReset(e.osError?.errorCode)) {
               d.rttMs ??= sw.elapsedMilliseconds;
             }
           } catch (_) {}

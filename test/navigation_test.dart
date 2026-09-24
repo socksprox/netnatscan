@@ -248,7 +248,8 @@ void main() {
     // Connected network first (sorted), then strongest RSSI.
     expect(find.text('CoffeeShop-5G'), findsOneWidget);
     expect(find.text('Connected'), findsOneWidget);
-    expect(find.text('-42 dBm'), findsOneWidget);
+    // Card shows SNR (rssi -42 - noise -90), not the raw dBm value.
+    expect(find.textContaining('SNR 48 dB'), findsOneWidget);
     // Private enrichment lands: precise security + PHY + tags.
     expect(find.textContaining('WPA2-PSK (CCMP-128)'), findsOneWidget);
     expect(find.textContaining('802.11ax'), findsOneWidget);
