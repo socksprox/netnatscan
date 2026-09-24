@@ -248,14 +248,12 @@ _Probe _fireEcho(
   final probe = _Probe(v6: v6)
     ..event = event
     ..reply = reply;
-  if (r > 0) {
-    probe.result = _parseEcho(reply, v6);
-  } else {
-    final err = w.wsaGetLastError();
-    if (err != 997 /* ERROR_IO_PENDING */) {
-      probe.result = _EchoError(err);
-    }
-  }
+  // r > 0 = completed inline. r == 0 normally means ERROR_IO_PENDING —
+  // but the FFI trampoline can clobber GetLastError before we read it,
+  // so a failed send is indistinguishable from pending. Treating 0 as
+  // pending is safe: a real failure never signals the event, so the
+  // probe just resolves as a timeout at the deadline.
+  if (r > 0) probe.result = _parseEcho(reply, v6);
   return probe;
 }
 
@@ -614,21 +612,10 @@ Future<void> _routeJob(
             : nullptr;
         final srcSa =
             v6 ? w.sockaddrIn6(arena, InternetAddress('::')) : nullptr;
-        var sendErr = 0;
         for (var p = 0; p < pph; p++) {
-          final probe = _fireEcho(arena, handle, v6, dst, destV4, dstSa,
+          probes[p] = _fireEcho(arena, handle, v6, dst, destV4, dstSa,
               srcSa, v6 ? 32 : 24, hop, maxDelay, false);
-          if (probe.result case _EchoError(:final status)) {
-            sendErr = status;
-          }
-          probes[p] = probe;
           if (p + 1 < pph && minDelay > 0) w.sleepMs(minDelay);
-        }
-        if (sendErr != 0) {
-          emit({
-            'type': 'note',
-            'message': 'probe send failed: $sendErr'
-          });
         }
 
         // Collect until all answered or the deadline passes.
